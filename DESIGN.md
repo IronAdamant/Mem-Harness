@@ -51,6 +51,27 @@ Agent identity: `main` for the main session; sub-agents
 `identity::subagent_name(agent_type, agent_id)` (the Libellus 1.4 scheme), used
 for every tool.
 
+## Config layers and extension points
+
+`Config::load` reads three layers. The user's own file
+(`$MEM_HARNESS_CONFIG`, else `~/.mem-harness/harness.json`, else the built-in
+one) is the only layer that may name commands. The project's
+`.mem-harness/harness.json` is an overlay limited to `PROJECT_KEYS`, because
+Claude Code may open any repository. `$MEM_HARNESS_PROFILE` is applied last.
+Every problem is an `Err`, never a panic.
+
+Adding things without code:
+- a stdio MCP server is a `backends` entry. It may set `handshake_s`,
+  `call_s`, `env_pass` (a restricted environment), and `hide_tools` /
+  `only_tools`, which the proxy enforces whatever the server honours;
+- a brief section is a `brief_sections` entry (`parse: text` for any CLI);
+- a store for `init` is a `stores` entry.
+
+A new backend kind (for example local HTTP) is a name in `KNOWN_KINDS` plus
+an arm in `mh_backend::build`. Its own settings are read from
+`BackendSpec::raw`, so `BackendSpec` does not change. HTTPS would need a TLS
+dependency, which the zero-dependency rule excludes; use a stdio bridge.
+
 ## Contracts between crates
 
 ```rust
