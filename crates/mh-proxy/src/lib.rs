@@ -4,7 +4,14 @@
 //! Protocol: MCP over stdio, newline-delimited JSON-RPC 2.0. Input is read
 //! on the calling thread; every tool call runs on its own thread, so a slow
 //! call never blocks another. All output goes through one mutex, one
-//! message per line, flushed after each.
+//! message per line, flushed after each. No batches; lines over
+//! [`MAX_LINE`] bytes are answered -32700 and skipped.
+//!
+//! A backend whose start or `tools/list` failed is fetched again: by a
+//! timer with backoff, by a later `tools/list`, and by a call to a name
+//! under its prefix; when its tools appear the client gets
+//! `notifications/tools/list_changed`. A backend's `hide_tools` and
+//! `only_tools` are applied here, whatever the backend itself honours.
 
 mod catalog;
 mod server;
@@ -17,7 +24,7 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub use server::{DEFAULT_PROTOCOL, PROTOCOL_VERSIONS};
+pub use server::{DEFAULT_PROTOCOL, MAX_LINE, PROTOCOL_VERSIONS};
 pub use text::{instructions, INSTRUCTIONS_MAX};
 
 /// A tool the harness answers itself.
