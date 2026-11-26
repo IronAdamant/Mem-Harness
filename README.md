@@ -100,7 +100,7 @@ tool.
 ## Roll back
 
 Restore the `.bak-mem-harness-*` copies of `~/.claude.json` and
-`~/.claude/settings.json` that step 0 of `mem-harness install` made, and
-restart Claude Code. Without a backup, run `claude mcp remove --scope user
+`~/.claude/settings.json`, which you made by running the step 0 commands that
+`mem-harness install` prints, and restart Claude Code. Without a backup, run `claude mcp remove --scope user
 mem-harness`, delete the `mem-harness hook` entries from
 `~/.claude/settings.json`, and add back the per-tool servers.
