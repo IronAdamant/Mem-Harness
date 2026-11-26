@@ -5,14 +5,19 @@
 //! - `FAKE_LOG=<file>`: append every line received.
 //! - `FAKE_PAGES=<n>`: `tools/list` in n pages of 2 tools (default 1 page).
 //! - `FAKE_STARTUP_EXIT=<msg>`: print `<msg>` to stderr and exit 2 at once.
+//! - `FAKE_STARTUP_HANG=1`: never read stdin (never answers `initialize`).
 //! - `FAKE_GARBAGE=1`: print a non-JSON line before anything else.
 //! - `FAKE_IGNORE_EOF=1`: keep running after stdin closes.
+//!
+//! The log also gets `{"event":"started","pid":N}` at start and
+//! `{"event":"stdin-eof"}` when stdin closes.
 //!
 //! Tools: `echo` (returns its arguments and `_meta`; `delay_ms` delays the
 //! reply), `slow` (`ms`, stops on `notifications/cancelled`), `fail`
 //! (JSON-RPC error -32000), `crash` (exit 3), `notify` (list_changed,
 //! progress, message, then a reply), `ping` (sends the client a `ping` and
-//! an unknown request, replies with both answers).
+//! an unknown request, replies with both answers), `env` (`names`: a list
+//! of variable names; returns `{"vars": {name: value or null}}`).
 
 use mh_json::Value;
 use std::io::{BufRead, Write};
@@ -103,6 +108,11 @@ fn main() {
         eprintln!("{msg}");
         std::process::exit(2);
     }
+    if std::env::var("FAKE_STARTUP_HANG").is_ok() {
+        loop {
+            thread::sleep(Duration::from_secs(60));
+        }
+    }
     let out: Out = Arc::new(Mutex::new(std::io::stdout()));
     if std::env::var("FAKE_GARBAGE").is_ok() {
         let mut o = out.lock().unwrap();
@@ -110,6 +120,10 @@ fn main() {
         let _ = o.flush();
     }
     eprintln!("fake: started");
+    log(&format!(
+        "{{\"event\":\"started\",\"pid\":{}}}",
+        std::process::id()
+    ));
     let pages: usize = std::env::var("FAKE_PAGES")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -317,6 +331,28 @@ fn main() {
                         send(&out, &req("srv-ping", "ping"));
                         send(&out, &req("srv-other", "sampling/createMessage"));
                     }
+                    "env" => {
+                        let vars = args
+                            .get("names")
+                            .and_then(Value::as_array)
+                            .map(|names| {
+                                names
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .map(|n| {
+                                        let v =
+                                            std::env::var(n).map(Value::str).unwrap_or(Value::Null);
+                                        (n.to_string(), v)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        let mut obj = Value::obj(vec![]);
+                        for (k, v) in vars {
+                            obj.set(&k, v);
+                        }
+                        reply(&out, &id, Value::obj(vec![("vars", obj)]));
+                    }
                     other => error(&out, &id, -32602, &format!("unknown tool {other}"), None),
                 }
             }
@@ -330,6 +366,7 @@ fn main() {
             ),
         }
     }
+    log("{\"event\":\"stdin-eof\"}");
     if std::env::var("FAKE_IGNORE_EOF").is_ok() {
         loop {
             thread::sleep(Duration::from_secs(60));
