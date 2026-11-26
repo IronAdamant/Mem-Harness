@@ -4,7 +4,7 @@ use mh_backend::stdio::{Limits, StdioBackend};
 use mh_backend::{Backend, BackendEvent, CallError, CancelToken, EventSink};
 use mh_core::BackendSpec;
 use mh_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -525,7 +525,12 @@ fn shutdown_fails_calls_in_flight_and_kills_a_stubborn_server() {
                 &CancelToken::new(),
             )
         });
-        thread::sleep(Duration::from_millis(300));
+        // Shut down only once the call is in flight at the server.
+        assert!(wait_for(|| logged(&f)
+            .iter()
+            .any(
+                |m| m.get("method").and_then(Value::as_str) == Some("tools/call")
+            )));
         f.backend.shutdown();
         let e = unavailable(call.join().unwrap().unwrap_err());
         assert!(e.contains("shut down") || e.contains("exited"), "{e}");
@@ -547,14 +552,171 @@ fn shutdown_fails_calls_in_flight_and_kills_a_stubborn_server() {
     assert_eq!(f.backend.status().starts, 2);
 }
 
-#[test]
-fn drop_stops_the_server() {
-    let f = fixture("drop", &[], quick());
+fn log_lines(log: &Path) -> Vec<Value> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| mh_json::parse(l).ok())
+        .collect()
+}
+
+fn has_event(log: &Path, event: &str) -> bool {
+    log_lines(log)
+        .iter()
+        .any(|m| m.get("event").and_then(Value::as_str) == Some(event))
+}
+
+/// The fake's pid, from its `started` log line.
+fn fake_pid(log: &Path) -> Option<i64> {
+    log_lines(log)
+        .iter()
+        .find(|m| m.get("event").and_then(Value::as_str) == Some("started"))
+        .and_then(|m| m.get("pid").and_then(Value::as_i64))
+}
+
+/// Is a process with this pid still there (`kill -0`)? A zombie counts;
+/// the backend reaps its children.
+#[cfg(unix)]
+fn alive(pid: i64) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Drop the backend and check the server is gone.
+fn assert_drop_stops(f: Fixture) {
     f.backend.start().unwrap();
     let log = f.log.clone();
+    assert!(!has_event(&log, "stdin-eof"));
+    let pid = fake_pid(&log).unwrap();
+    let t0 = Instant::now();
     drop(f.backend);
-    // The fake saw stdin close and exited; nothing else to observe but that
-    // drop returns promptly and the log has the handshake.
-    let text = std::fs::read_to_string(log).unwrap();
-    assert!(text.contains("initialize"));
+    assert!(t0.elapsed() < Duration::from_secs(3));
+    // Drop closed the server's stdin ...
+    assert!(wait_for(|| has_event(&log, "stdin-eof")));
+    // ... and the server is gone (killed, if it ignores EOF).
+    #[cfg(unix)]
+    assert!(wait_for(|| !alive(pid)), "pid {pid} still running");
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
+#[test]
+fn drop_stops_the_server() {
+    assert_drop_stops(fixture("drop", &[], quick()));
+}
+
+#[test]
+fn drop_kills_a_server_that_ignores_eof() {
+    let limits = Limits {
+        shutdown_grace: Duration::from_millis(200),
+        ..quick()
+    };
+    assert_drop_stops(fixture("dropkill", &[("FAKE_IGNORE_EOF", "1")], limits));
+}
+
+#[test]
+fn a_server_that_hangs_at_startup_trips_the_storm_guard() {
+    let limits = Limits {
+        handshake: Duration::from_millis(300),
+        restart_block: Duration::from_secs(30),
+        ..quick()
+    };
+    let f = fixture("hang", &[("FAKE_STARTUP_HANG", "1")], limits);
+    for _ in 0..3 {
+        let e = unavailable(f.backend.start().unwrap_err());
+        assert!(e.contains("initialize failed"), "{e}");
+    }
+    assert_eq!(f.backend.status().starts, 3);
+    let e = unavailable(f.backend.start().unwrap_err());
+    assert!(e.contains("not restarting"), "{e}");
+    assert_eq!(f.backend.status().starts, 3, "no spawn while blocked");
+}
+
+#[test]
+fn limits_come_from_the_spec() {
+    let dir = temp_dir("speclimits");
+    let mut s = spec(FAKE);
+    s.call_s = 1;
+    s.handshake_s = 5;
+    let b = StdioBackend::new(&s, vec![], &dir, Arc::new(|_, _| {}));
+    let t0 = Instant::now();
+    let r = b.call_tool(
+        "slow",
+        Value::obj(vec![("ms", Value::int(20_000))]),
+        None,
+        &CancelToken::new(),
+    );
+    assert!(
+        matches!(r, Err(CallError::Timeout(ref s)) if s.contains("within 1 s")),
+        "{r:?}"
+    );
+    assert!(t0.elapsed() < Duration::from_secs(4));
+}
+
+fn env_of(b: &StdioBackend, names: &[&str]) -> Value {
+    let names = Value::Array(names.iter().map(|n| Value::str(*n)).collect());
+    b.call_tool(
+        "env",
+        Value::obj(vec![("names", names)]),
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap()
+    .get("vars")
+    .cloned()
+    .unwrap()
+}
+
+#[test]
+fn env_pass_restricts_the_environment() {
+    // Cargo sets both for test processes; neither is in BASE_ENV.
+    let passed = "CARGO_MANIFEST_DIR";
+    let other = "CARGO_PKG_NAME";
+    let here = |k: &str| std::env::var(k).map(Value::str).unwrap_or(Value::Null);
+    assert!(std::env::var(passed).is_ok() && std::env::var(other).is_ok());
+    let names = [
+        passed,
+        other,
+        "PATH",
+        "SPEC_VAR",
+        "EXTRA_VAR",
+        "MH_NOT_SET_ANYWHERE",
+    ];
+    let dir = temp_dir("envpass");
+    let extra = vec![("EXTRA_VAR".to_string(), "from-env-arg".to_string())];
+
+    // Inherit (env_pass None): ours are all there, plus spec.env and env.
+    let mut s = spec(FAKE);
+    s.env = vec![("SPEC_VAR".into(), "from-spec".into())];
+    let b = StdioBackend::new(&s, extra.clone(), &dir, Arc::new(|_, _| {}));
+    let v = env_of(&b, &names);
+    assert_eq!(v.get(passed), Some(&here(passed)));
+    assert_eq!(v.get(other), Some(&here(other)));
+    assert_eq!(v.get("SPEC_VAR"), Some(&Value::str("from-spec")));
+    assert_eq!(v.get("EXTRA_VAR"), Some(&Value::str("from-env-arg")));
+
+    // Restricted: BASE_ENV, the listed variables we have, spec.env and env.
+    s.env_pass = Some(vec![passed.into(), "MH_NOT_SET_ANYWHERE".into()]);
+    let b = StdioBackend::new(&s, extra, &dir, Arc::new(|_, _| {}));
+    let v = env_of(&b, &names);
+    assert_eq!(v.get(passed), Some(&here(passed)));
+    assert_eq!(v.get(other), Some(&Value::Null), "{v:?}");
+    assert_eq!(v.get("PATH"), Some(&here("PATH")));
+    assert_eq!(v.get("SPEC_VAR"), Some(&Value::str("from-spec")));
+    assert_eq!(v.get("EXTRA_VAR"), Some(&Value::str("from-env-arg")));
+    assert_eq!(v.get("MH_NOT_SET_ANYWHERE"), Some(&Value::Null));
+}
+
+#[test]
+fn unknown_kind_lists_the_known_ones() {
+    let mut s = spec(FAKE);
+    s.kind = "http-mcp".into();
+    let e = mh_backend::build(&s, vec![], &temp_dir("kind"), Arc::new(|_, _| {}))
+        .err()
+        .unwrap();
+    assert!(e.contains("unknown kind \"http-mcp\""), "{e}");
+    assert!(e.contains("known: stdio-mcp"), "{e}");
 }
