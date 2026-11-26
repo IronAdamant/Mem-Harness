@@ -33,7 +33,7 @@ pub fn run_command(
     cwd: &Path,
     timeout: Duration,
 ) -> Result<CmdOut, String> {
-    let path = mh_core::project::find_command(program)
+    let path = mh_core::project::find_command(program, cwd)
         .ok_or_else(|| format!("{program} not found on PATH or in ~/.cargo/bin; install it"))?;
     let mut child = Command::new(path)
         .args(args)

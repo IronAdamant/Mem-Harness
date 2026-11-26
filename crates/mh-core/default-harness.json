@@ -33,6 +33,18 @@
     "nudge_on_stop": true,
     "save_unrecorded_on_compact": true
   },
+  "stores": [
+    { "tool": "relatum", "dir": ".swarmnotes", "env": "SWARMNOTES_DIR", "init": ["relatum", "init"] },
+    { "tool": "libellus", "dir": ".libellus", "env": "LIBELLUS_DIR", "init": ["libellus", "init"] },
+    { "tool": "adsertio", "dir": ".adsertio", "env": "ADSERTIO_DIR", "init": ["adsertio", "init"] }
+  ],
+  "brief_sections": [
+    { "name": "libellus_brief", "parse": "libellus", "command": "libellus", "args": ["brief", "--agent", "{agent}"], "weight": 50 },
+    { "name": "relatum_ls", "parse": "relatum-rules", "weight": 20 },
+    { "name": "adsertio_view", "parse": "adsertio-claims", "command": "adsertio",
+      "args": ["view", "--compact", "--states", "unverified", "--states", "refuted", "--limit", "50", "--if-store"], "weight": 20 },
+    { "name": "issues", "parse": "chisel-issues", "command": "chisel", "args": ["issues", "--brief"], "weight": 10, "only_if_exists": ".chisel" }
+  ],
   "backends": [
     {
       "name": "stele",

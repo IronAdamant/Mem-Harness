@@ -599,7 +599,7 @@ impl StdioBackend {
     /// Start the process and its reader threads.
     fn spawn(&self) -> Result<Arc<Conn>, String> {
         let name = &self.core.name;
-        let path = mh_core::project::find_command(&self.command).ok_or_else(|| {
+        let path = mh_core::project::find_command(&self.command, &self.project).ok_or_else(|| {
             format!(
                 "{name}: cannot find `{}` on PATH or ~/.cargo/bin; install it or set `command` in harness.json",
                 self.command

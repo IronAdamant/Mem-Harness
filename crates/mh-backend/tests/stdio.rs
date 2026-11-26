@@ -24,17 +24,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 }
 
 fn spec(command: &str) -> BackendSpec {
-    BackendSpec {
-        name: "fake".into(),
-        kind: "stdio-mcp".into(),
-        command: command.into(),
-        args: vec!["serve".into()],
-        env: vec![],
-        disable_env: String::new(),
-        strip_prefix: String::new(),
-        disable: vec![],
-        role: String::new(),
-    }
+    BackendSpec::stdio("fake", command, &["serve"])
 }
 
 type Events = Arc<Mutex<Vec<(String, BackendEvent)>>>;
