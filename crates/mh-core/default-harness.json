@@ -34,9 +34,12 @@
     "save_unrecorded_on_compact": true
   },
   "stores": [
-    { "tool": "relatum", "dir": ".swarmnotes", "env": "SWARMNOTES_DIR", "init": ["relatum", "init"] },
-    { "tool": "libellus", "dir": ".libellus", "env": "LIBELLUS_DIR", "init": ["libellus", "init"] },
-    { "tool": "adsertio", "dir": ".adsertio", "env": "ADSERTIO_DIR", "init": ["adsertio", "init"] }
+    { "tool": "relatum", "dir": ".swarmnotes", "env": "SWARMNOTES_DIR", "init": ["relatum", "init"],
+      "save_hint": "relatum_new for a rule every agent must follow" },
+    { "tool": "libellus", "dir": ".libellus", "env": "LIBELLUS_DIR", "init": ["libellus", "init"],
+      "save_hint": "libellus_note (agent=\"{agent}\") for your own decisions and dead ends" },
+    { "tool": "adsertio", "dir": ".adsertio", "env": "ADSERTIO_DIR", "init": ["adsertio", "init"],
+      "save_hint": "adsertio_claim for a result" }
   ],
   "brief_sections": [
     { "name": "libellus_brief", "parse": "libellus", "command": "libellus", "args": ["brief", "--agent", "{agent}"], "weight": 50 },

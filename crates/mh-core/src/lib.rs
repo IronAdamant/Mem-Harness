@@ -9,4 +9,6 @@ pub mod config;
 pub mod identity;
 pub mod project;
 
-pub use config::{BackendSpec, Config, Ownership, Route, Trim};
+pub use config::{
+    BackendSpec, Config, Ownership, Route, SectionSpec, StoreSpec, Trim, BASE_ENV, KNOWN_KINDS,
+};

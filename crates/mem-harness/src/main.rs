@@ -255,6 +255,22 @@ fn cmd_ownership() -> Result<(), String> {
                 hidden.join(",")
             }
         );
+        if !b.hide_tools.is_empty() {
+            println!(
+                "  {:<9} {:<25} {}",
+                "",
+                "proxy hides",
+                b.hide_tools.join(",")
+            );
+        }
+        if !b.only_tools.is_empty() {
+            println!(
+                "  {:<9} {:<25} {}",
+                "",
+                "proxy shows only",
+                b.only_tools.join(",")
+            );
+        }
     }
     if !cfg.routes.is_empty() {
         println!("\nRoutes:");

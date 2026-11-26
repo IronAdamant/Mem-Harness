@@ -215,6 +215,7 @@ fn store_of(cfg: &Config, tool: &str, dir: &str, env: &str) -> StoreSpec {
             dir: dir.to_string(),
             env: env.to_string(),
             init: vec![tool.to_string(), "init".to_string()],
+            save_hint: String::new(),
         })
 }
 
@@ -531,26 +532,14 @@ fn read_tail(path: &Path) -> Result<String, String> {
     })
 }
 
-/// What the nudge says each store's tool is for, keyed by store tool.
-fn nudge_use(tool: &str, agent: &str) -> Option<String> {
-    Some(match tool {
-        "libellus" => {
-            format!("libellus_note (agent=\"{agent}\") for your own decisions and dead ends")
-        }
-        "relatum" => "relatum_new for a rule every agent must follow".to_string(),
-        "adsertio" => "adsertio_claim for a result".to_string(),
-        _ => return None,
-    })
-}
-
-/// The request sent back to an agent that is about to stop, naming only
-/// the save tools whose store exists (`present`, store tool names).
-/// `None` when no such tool is available.
-pub fn nudge_text(agent: &str, present: &[&str]) -> Option<String> {
-    let uses: Vec<String> = ["libellus", "relatum", "adsertio"]
-        .into_iter()
-        .filter(|t| present.contains(t))
-        .filter_map(|t| nudge_use(t, agent))
+/// The request sent back to an agent that is about to stop. It names the
+/// `save_hint` of each store in `present` (store tool names), in config
+/// order. `None` when none of them has a hint.
+pub fn nudge_text(stores: &[mh_core::StoreSpec], agent: &str, present: &[&str]) -> Option<String> {
+    let uses: Vec<String> = stores
+        .iter()
+        .filter(|st| present.contains(&st.tool.as_str()) && !st.save_hint.trim().is_empty())
+        .map(|st| st.save_hint.replace("{agent}", agent))
         .collect();
     if uses.is_empty() {
         return None;
@@ -616,7 +605,7 @@ pub fn stop(cfg: &Config, project: &Path, stdin: &str, subagent: bool) -> Result
     } else {
         cfg.main_agent.clone()
     };
-    let Some(reason) = nudge_text(&agent, &present) else {
+    let Some(reason) = nudge_text(&cfg.stores, &agent, &present) else {
         return allow;
     };
     Ok(Value::obj(vec![
@@ -929,15 +918,16 @@ mod tests {
 
     #[test]
     fn nudge_names_only_tools_with_a_store() {
-        let all = nudge_text("main", &["relatum", "libellus", "adsertio"]).unwrap();
+        let stores = Config::builtin().stores;
+        let all = nudge_text(&stores, "main", &["relatum", "libellus", "adsertio"]).unwrap();
         assert!(all.contains("libellus_note (agent=\"main\")") && all.contains("relatum_new"));
-        let some = nudge_text("main", &["relatum"]).unwrap();
+        let some = nudge_text(&stores, "main", &["relatum"]).unwrap();
         assert!(
             some.contains("relatum_new")
                 && !some.contains("libellus")
                 && !some.contains("adsertio")
         );
-        assert!(nudge_text("main", &["other"]).is_none());
+        assert!(nudge_text(&stores, "main", &["other"]).is_none());
     }
 
     #[test]

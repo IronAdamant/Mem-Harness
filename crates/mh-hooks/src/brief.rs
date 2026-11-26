@@ -289,8 +289,13 @@ fn label(spec: &SectionSpec) -> String {
 }
 
 /// One configured section: gate, run, read. `None` is no section.
+fn cfg_store<'a>(stores: &'a [mh_core::StoreSpec], tool: &str) -> Option<&'a mh_core::StoreSpec> {
+    stores.iter().find(|st| st.tool == tool)
+}
+
 fn run_section(
     spec: &SectionSpec,
+    stores: &[mh_core::StoreSpec],
     project: &Path,
     agent: &str,
     timeout: Duration,
@@ -300,7 +305,11 @@ fn run_section(
         return None;
     }
     if spec.parse == "relatum-rules" {
-        let store = mh_adapters::relatum::store_dir(project)?;
+        // The Relatum store from config when listed there, else its default.
+        let store = match cfg_store(stores, "relatum") {
+            Some(st) => mh_adapters::relatum::store_dir_in(project, &st.dir, &st.env)?,
+            None => mh_adapters::relatum::store_dir(project)?,
+        };
         return rules_lines(Some(mh_adapters::relatum::active_rules(&store)));
     }
     let args: Vec<String> = spec
@@ -350,6 +359,7 @@ type Runner<'a> = dyn Fn(&str, &[&str], &Path, Duration) -> Result<CmdOut, Strin
 /// sections are `cfg.brief_sections`, in order, each run on its own thread.
 pub fn compose_brief_with(cfg: &Config, project: &Path, agent: &str, run: &Runner) -> String {
     let timeout = Duration::from_secs(cfg.brief.command_timeout_s.max(1));
+    let stores = cfg.stores.as_slice();
     let built: Vec<Option<Section>> = std::thread::scope(|s| {
         let handles: Vec<_> = cfg
             .brief_sections
@@ -357,7 +367,7 @@ pub fn compose_brief_with(cfg: &Config, project: &Path, agent: &str, run: &Runne
             .map(|spec| {
                 (
                     spec,
-                    s.spawn(move || run_section(spec, project, agent, timeout, run)),
+                    s.spawn(move || run_section(spec, stores, project, agent, timeout, run)),
                 )
             })
             .collect();

@@ -139,6 +139,7 @@ mod tests {
             dir: dir.into(),
             env: format!("MH_TEST_UNSET_{}_DIR", tool.to_uppercase()),
             init: vec![format!("{tool}-cli"), "init".into()],
+            save_hint: String::new(),
         };
         vec![
             s("relatum", ".swarmnotes"),

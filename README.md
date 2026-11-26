@@ -126,7 +126,7 @@ Its tools appear as `docs_<tool>`. The optional settings:
 | `handshake_s` | how long to wait for it to start (default 20) |
 | `call_s` | the cap on one call (default 3600) |
 | `env_pass` | gives it only the basic system variables plus these, instead of your whole environment. Use it for servers you did not write. |
-| `hide_tools` / `only_tools` | the proxy hides tools itself, so this works for servers that have no `*_DISABLE` variable. `*` is a wildcard. |
+| `hide_tools` / `only_tools` | the proxy hides tools itself, so this works for servers that have no `*_DISABLE` variable. A pattern matches the server's own tool name, or that name after `strip_prefix`. `*` is a wildcard. |
 
 A remote server works through a stdio bridge such as `mcp-remote`. The
 harness has no dependencies, and Rust's standard library has no TLS, so it

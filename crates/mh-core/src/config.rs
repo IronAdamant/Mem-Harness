@@ -115,6 +115,10 @@ pub struct StoreSpec {
     pub env: String,
     /// The command and arguments that create it.
     pub init: Vec<String>,
+    /// How the stop nudge names this tool's save tool, for example
+    /// `relatum_new for a rule every agent must follow`; `{agent}` is the
+    /// agent's name. Empty: the nudge does not mention it.
+    pub save_hint: String,
 }
 
 /// One section of the brief. `parse` picks the reader for the command's
@@ -371,15 +375,23 @@ impl Config {
         format!("{backend}_{bare}")
     }
 
-    /// Does the proxy show `backend`'s tool `own` (its own, unprefixed name)?
+    /// Does the proxy show `backend`'s tool `own` (the name the backend
+    /// lists)? A pattern may match that name or the name after
+    /// `strip_prefix` (`attach` for Adsertio's `adsertio_attach`).
     pub fn tool_visible(&self, backend: &str, own: &str) -> bool {
         let Some(b) = self.backend(backend) else {
             return true;
         };
-        if b.hide_tools.iter().any(|p| glob(p, own)) {
+        let stripped = if b.strip_prefix.is_empty() {
+            own
+        } else {
+            own.strip_prefix(b.strip_prefix.as_str()).unwrap_or(own)
+        };
+        let hit = |p: &String| glob(p, own) || glob(p, stripped);
+        if b.hide_tools.iter().any(hit) {
             return false;
         }
-        b.only_tools.is_empty() || b.only_tools.iter().any(|p| glob(p, own))
+        b.only_tools.is_empty() || b.only_tools.iter().any(hit)
     }
 
     /// Every program the hooks and `init` run, with what needs it.
@@ -992,6 +1004,7 @@ fn parse_config(v: &Value, _source: &str) -> Result<Config, String> {
                 dir: str_field(st, "dir", &ctx)?,
                 env: opt_str(st, "env"),
                 init: str_list(st.get("init"), &format!("{ctx}.init"))?,
+                save_hint: opt_str(st, "save_hint"),
             });
         }
     }
@@ -1177,8 +1190,9 @@ mod review_tests {
             p.set("only_tools", mh_json::parse(r#"["mutate_*"]"#).unwrap());
         })
         .unwrap();
+        assert!(!c.tool_visible("adsertio", "adsertio_attach"));
         assert!(!c.tool_visible("adsertio", "attach"));
-        assert!(c.tool_visible("adsertio", "claim"));
+        assert!(c.tool_visible("adsertio", "adsertio_claim"));
         assert!(c.tool_visible("probatio", "mutate_run"));
         assert!(!c.tool_visible("probatio", "schema"));
     }

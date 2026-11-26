@@ -39,19 +39,27 @@ pub fn valid_id(id: &str) -> bool {
 /// `$SWARMNOTES_DIR`, else the nearest `.swarmnotes` directory at or above
 /// `project`.
 pub fn store_dir(project: &Path) -> Option<PathBuf> {
-    if let Some(env) = std::env::var_os("SWARMNOTES_DIR") {
-        if !env.is_empty() {
-            let p = PathBuf::from(env);
-            return p.is_dir().then_some(p);
+    store_dir_in(project, DIR_NAME, "SWARMNOTES_DIR")
+}
+
+/// The store folder `dir`, moved by the variable `env` (when set and not
+/// empty), else the nearest `dir` at or above `project`.
+pub fn store_dir_in(project: &Path, dir: &str, env: &str) -> Option<PathBuf> {
+    if !env.is_empty() {
+        if let Some(v) = std::env::var_os(env) {
+            if !v.is_empty() {
+                let p = PathBuf::from(v);
+                return p.is_dir().then_some(p);
+            }
         }
     }
     let mut cur = Some(project);
-    while let Some(dir) = cur {
-        let cand = dir.join(DIR_NAME);
+    while let Some(d) = cur {
+        let cand = d.join(dir);
         if cand.is_dir() {
             return Some(cand);
         }
-        cur = dir.parent();
+        cur = d.parent();
     }
     None
 }
