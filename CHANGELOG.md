@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1
+
+- **Fix:** when a backend crashes, its status now records the exit before the waiting calls are failed. Previously a caller could see the crash error and then read a status that showed no error yet. This also made one backend test fail about once in 600 runs, and once on main CI.
+- README: "Roll back" now says the backups come from the commands `mem-harness install` prints.
+- The `mem-harness` crate now uses the workspace `description`.
+
 ## 0.2.0
 
 **Memory that was never saved**
