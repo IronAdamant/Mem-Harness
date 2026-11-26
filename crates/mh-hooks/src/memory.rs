@@ -10,7 +10,9 @@
 //!   heading as Libellus notes, so they outlive this session too.
 //! - Stop and SubagentStop: when the turn changed files but saved no note,
 //!   rule or claim, it keeps the agent going once with a request to save
-//!   them. `stop_hook_active` stops it from asking twice.
+//!   them. `stop_hook_active` stops it from asking twice, and the git
+//!   snapshot baseline ([`crate::snapshot`]) from asking again about the
+//!   same changes in a later turn.
 
 use crate::run::CmdOut;
 use mh_core::config::{BriefConfig, StoreSpec};
@@ -18,7 +20,7 @@ use mh_core::{identity::subagent_name, Config};
 use mh_json::Value;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The heading the compact summary is asked to use.
 pub const UNRECORDED_HEADING: &str = "## Not yet recorded";
@@ -51,8 +53,10 @@ their own after the compact, so leave them out. If nothing is unsaved, write \"-
 enum Label {
     /// A `#`..`######` heading of that level.
     Heading(usize, String),
-    /// A numbered (`8. Title:`) or bold (`**Title**`) line standing alone.
-    Plain(String),
+    /// A numbered line standing alone (`8. Title:`, `8. **Title**`).
+    Numbered(String),
+    /// A bold line standing alone (`**Title**`).
+    Bold(String),
 }
 
 /// The text of a label with bold markers and a trailing colon removed.
@@ -77,6 +81,13 @@ fn strip_number(t: &str) -> Option<&str> {
     rest.starts_with(char::is_whitespace).then(|| rest.trim())
 }
 
+/// `- `, `* ` or `+ ` at the start of `t`, returning the rest.
+fn strip_bullet(t: &str) -> Option<&str> {
+    t.strip_prefix("- ")
+        .or_else(|| t.strip_prefix("* "))
+        .or_else(|| t.strip_prefix("+ "))
+}
+
 fn is_bold(t: &str) -> bool {
     let t = t.trim_end_matches(':').trim_end();
     (t.starts_with("**") && t.ends_with("**") && t.len() > 4)
@@ -97,11 +108,26 @@ fn label(t: &str) -> Option<Label> {
     }
     if let Some(rest) = strip_number(t) {
         if rest.ends_with(':') || is_bold(rest) {
-            return Some(Label::Plain(label_text(rest)));
+            return Some(Label::Numbered(label_text(rest)));
         }
         return None;
     }
-    is_bold(t).then(|| Label::Plain(label_text(t)))
+    is_bold(t).then(|| Label::Bold(label_text(t)))
+}
+
+/// `(kind, text)` when `s` starts with a known kind and a colon
+/// (`decision: x`, `**Dead end**: x`).
+fn kind_of(s: &str) -> Option<(String, &str)> {
+    let (k, rest) = s.split_once(':')?;
+    let k = k
+        .trim()
+        .trim_matches('*')
+        .trim()
+        .to_ascii_lowercase()
+        .replace(' ', "-");
+    KINDS
+        .contains(&k.as_str())
+        .then(|| (k, rest.trim_start_matches('*').trim()))
 }
 
 /// Control characters become spaces, then runs of whitespace one space:
@@ -114,16 +140,28 @@ fn sanitize(s: &str) -> String {
     t.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// How the open "Not yet recorded" section was labelled, which decides
+/// what ends it.
+#[derive(Clone, Copy)]
+enum Open {
+    Heading(usize),
+    Numbered,
+    Bold,
+}
+
 /// The `(kind, summary)` lines under the "Not yet recorded" label in
 /// `summary`: a heading at any level, a numbered (`8. Not yet recorded:`)
 /// or bold (`**Not yet recorded**`) line, any case, colon optional. Lines
-/// in ``` fences are skipped. A section opened by a heading ends at a
-/// heading of the same or a higher level, or at a numbered or bold label;
-/// one opened by a numbered or bold label ends at any label.
+/// in ``` fences are skipped. Inside the section, a line that starts with
+/// a known kind and a colon (bulleted, numbered or bare) is always an
+/// item, even when it ends in a colon; other bulleted or numbered lines are
+/// items of kind `context`. A section opened by a heading ends at a heading
+/// of the same or a higher level or at a numbered label; one opened by a
+/// numbered label ends at any heading or numbered label (a bold line inside
+/// either is a sub-heading); one opened by a bold label ends at any label.
 pub fn unrecorded_items(summary: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    // None: outside. Some(level): inside; level 7 for a non-heading label.
-    let mut inside: Option<usize> = None;
+    let mut inside: Option<Open> = None;
     let mut fence: Option<char> = None;
     for line in summary.lines() {
         let t = line.trim();
@@ -137,50 +175,44 @@ pub fn unrecorded_items(summary: &str) -> Vec<(String, String)> {
             fence = t.chars().next();
             continue;
         }
-        if let Some(l) = label(t) {
-            let (level, text) = match l {
-                Label::Heading(n, s) => (n, s),
-                Label::Plain(s) => (7, s),
-            };
-            let opens = text.eq_ignore_ascii_case(UNRECORDED_LABEL);
-            match inside {
-                _ if opens => inside = Some(level),
-                Some(open) if level == 7 || level <= open => inside = None,
-                _ => {}
+        let marked = strip_bullet(t).or_else(|| strip_number(t));
+        let item = sanitize(marked.unwrap_or(t));
+        // A kind with no text (`9. Context:`) is a label, not an item.
+        let known = kind_of(&item).filter(|(_, text)| !text.is_empty());
+        if known.is_none() {
+            if let Some(l) = label(t) {
+                let text = match &l {
+                    Label::Heading(_, s) | Label::Numbered(s) | Label::Bold(s) => s,
+                };
+                if text.eq_ignore_ascii_case(UNRECORDED_LABEL) {
+                    inside = Some(match l {
+                        Label::Heading(n, _) => Open::Heading(n),
+                        Label::Numbered(_) => Open::Numbered,
+                        Label::Bold(_) => Open::Bold,
+                    });
+                    continue;
+                }
+                let ends = match (inside, &l) {
+                    (None, _) => false,
+                    (Some(Open::Heading(open)), Label::Heading(n, _)) => *n <= open,
+                    (Some(Open::Heading(_) | Open::Numbered), Label::Bold(_)) => false,
+                    _ => true,
+                };
+                if ends {
+                    inside = None;
+                }
+                continue;
             }
-            continue;
         }
         if inside.is_none() {
             continue;
         }
-        let Some(item) = t
-            .strip_prefix("- ")
-            .or_else(|| t.strip_prefix("* "))
-            .or_else(|| t.strip_prefix("+ "))
-            .or_else(|| strip_number(t))
-        else {
-            continue;
+        let (kind, text) = match known {
+            Some((k, text)) => (k, text),
+            None if marked.is_some() => ("context".to_string(), item.as_str()),
+            None => continue,
         };
-        let item = sanitize(item);
-        if item.is_empty() || item.trim_end_matches('.').eq_ignore_ascii_case("none") {
-            continue;
-        }
-        let (kind, text) = match item.split_once(':') {
-            Some((k, rest)) => {
-                let k = k
-                    .trim()
-                    .trim_matches('*')
-                    .to_ascii_lowercase()
-                    .replace(' ', "-");
-                if KINDS.contains(&k.as_str()) {
-                    (k, rest.trim_start_matches('*').trim())
-                } else {
-                    ("context".to_string(), item.as_str())
-                }
-            }
-            None => ("context".to_string(), item.as_str()),
-        };
-        if text.is_empty() {
+        if text.is_empty() || text.trim_end_matches('.').eq_ignore_ascii_case("none") {
             continue;
         }
         out.push((kind, clip(text, MAX_SUMMARY)));
@@ -202,6 +234,15 @@ fn clip(s: &str, max: usize) -> String {
 }
 
 type Runner<'a> = dyn Fn(&str, &[&str], &Path, Duration) -> Result<CmdOut, String> + Sync + 'a;
+
+/// The whole of PostCompact (listing, checking and saving) stops here.
+const COMPACT_DEADLINE: Duration = Duration::from_secs(30);
+/// Notes asked for per `libellus ls` page; halved (down to `MIN_PAGE`)
+/// when a page's output is too large to read whole.
+const PAGE: usize = 2000;
+const MIN_PAGE: usize = 125;
+/// At most this many `libellus get` calls check tags in one PostCompact.
+const MAX_GETS: usize = 2 * MAX_ITEMS;
 
 /// The configured store of `tool`, or its usual place when the config has
 /// none.
@@ -229,59 +270,135 @@ fn first_line(o: &CmdOut) -> String {
         .to_string()
 }
 
+/// The time left for one call: the command timeout, cut to the overall
+/// deadline. `None` once the deadline passed.
+fn left(deadline: Instant, timeout: Duration) -> Option<Duration> {
+    let d = deadline.saturating_duration_since(Instant::now());
+    (!d.is_zero()).then(|| d.min(timeout))
+}
+
+/// What the check for earlier `from-compact` notes found.
+#[derive(Debug, Default)]
+struct Earlier {
+    /// Wanted summaries saved by an earlier compact.
+    found: Vec<String>,
+    /// Why not every note could be checked, when that happened.
+    incomplete: Option<String>,
+}
+
 /// The summaries of the agent's notes tagged `from-compact` that equal one
 /// of `wanted`. `libellus ls` lists every note's summary but not its tags,
-/// so only the notes whose summary matches are read with `libellus get`.
+/// so the notes are listed page by page (newest first, by the
+/// `next_before_id` cursor, so a large store is read whole) and only those
+/// whose summary matches are read with `libellus get`, at most
+/// `MAX_GETS` times. Stops early once every wanted summary was found.
 fn saved_from_compact(
     project: &Path,
     agent: &str,
     wanted: &[&str],
     timeout: Duration,
+    deadline: Instant,
     run: &Runner,
-) -> Result<Vec<String>, String> {
-    let args = ["ls", "--agent", agent, "--limit", "1000000"];
-    let o = run("libellus", &args, project, timeout)?;
-    if o.code != Some(0) {
-        return Err(format!("libellus ls failed: {}", first_line(&o)));
-    }
-    let v = mh_json::parse(o.stdout.trim())
-        .map_err(|e| format!("libellus ls output is not JSON ({})", e.msg))?;
-    let mut found = Vec::new();
-    for n in v
-        .get("notes")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-    {
-        let (Some(id), Some(summary)) = (
-            n.get("id").and_then(Value::as_str),
-            n.get("summary").and_then(Value::as_str),
-        ) else {
-            continue;
+) -> Earlier {
+    let mut e = Earlier::default();
+    let mut cursor: Option<String> = None;
+    let mut page = PAGE;
+    let mut gets = 0;
+    let mut checked: Vec<String> = Vec::new();
+    while e.found.len() < wanted.len() {
+        let Some(t) = left(deadline, timeout) else {
+            e.incomplete = Some("out of time".to_string());
+            break;
         };
-        if !wanted.contains(&summary) || found.iter().any(|f| f == summary) {
-            continue;
+        let limit = page.to_string();
+        let mut args = vec!["ls", "--agent", agent, "--limit", limit.as_str()];
+        if let Some(c) = &cursor {
+            args.extend(["--before_id", c.as_str()]);
         }
-        let g = run(
-            "libellus",
-            &["get", "--agent", agent, "--id", id],
-            project,
-            timeout,
-        )?;
-        let tagged = g.code == Some(0)
-            && mh_json::parse(g.stdout.trim())
-                .ok()
-                .and_then(|v| {
-                    v.get("tags")
-                        .and_then(Value::as_array)
-                        .map(|t| t.iter().any(|x| x.as_str() == Some(FROM_COMPACT)))
-                })
-                .unwrap_or(false);
-        if tagged {
-            found.push(summary.to_string());
+        let o = match run("libellus", &args, project, t) {
+            Ok(o) if o.code == Some(0) => o,
+            Ok(o) => {
+                e.incomplete = Some(format!("libellus ls failed: {}", first_line(&o)));
+                break;
+            }
+            Err(err) => {
+                e.incomplete = Some(err);
+                break;
+            }
+        };
+        let v = match mh_json::parse(o.stdout.trim()) {
+            Ok(v) => v,
+            // Most likely cut at the output cap: ask for a smaller page.
+            Err(_) if page > MIN_PAGE => {
+                page /= 2;
+                continue;
+            }
+            Err(err) => {
+                e.incomplete = Some(format!("libellus ls output is not JSON ({})", err.msg));
+                break;
+            }
+        };
+        for n in v
+            .get("notes")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        {
+            let (Some(id), Some(summary)) = (
+                n.get("id").and_then(Value::as_str),
+                n.get("summary").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            if !wanted.contains(&summary) || e.found.iter().any(|f| f == summary) {
+                continue;
+            }
+            if checked.iter().any(|c| c == id) {
+                continue;
+            }
+            if gets == MAX_GETS {
+                e.incomplete = Some(format!("more than {MAX_GETS} notes share these summaries"));
+                return e;
+            }
+            let Some(t) = left(deadline, timeout) else {
+                e.incomplete = Some("out of time".to_string());
+                return e;
+            };
+            gets += 1;
+            checked.push(id.to_string());
+            let g = match run(
+                "libellus",
+                &["get", "--agent", agent, "--id", id],
+                project,
+                t,
+            ) {
+                Ok(g) => g,
+                Err(err) => {
+                    e.incomplete = Some(err);
+                    return e;
+                }
+            };
+            let tagged = g.code == Some(0)
+                && mh_json::parse(g.stdout.trim())
+                    .ok()
+                    .and_then(|v| {
+                        v.get("tags")
+                            .and_then(Value::as_array)
+                            .map(|t| t.iter().any(|x| x.as_str() == Some(FROM_COMPACT)))
+                    })
+                    .unwrap_or(false);
+            if tagged {
+                e.found.push(summary.to_string());
+            }
+        }
+        match v.get("next_before_id").and_then(Value::as_str) {
+            Some(c) if v.get("truncated").and_then(Value::as_bool) != Some(false) => {
+                cursor = Some(c.to_string())
+            }
+            _ => break,
         }
     }
-    Ok(found)
+    e
 }
 
 fn notes_json(items: &[(String, String)]) -> String {
@@ -300,13 +417,26 @@ fn notes_json(items: &[(String, String)]) -> String {
     .to_json()
 }
 
+/// Why a `libellus note` call saved nothing.
+enum NoteErr {
+    /// Libellus ran and refused the batch (non-zero exit): one bad line
+    /// refuses them all, so the lines are worth retrying alone.
+    Refused(String),
+    /// It did not run to the end (timeout, cannot start, out of time):
+    /// retrying would only wait again.
+    Failed(String),
+}
+
 /// PostCompact: save the unrecorded lines of `compact_summary` as Libellus
 /// notes for the main agent. Lines already saved by an earlier compact (a
-/// `from-compact` note with the same summary) are skipped. When Libellus
-/// refuses the batch, each line is retried alone so one bad line does not
-/// lose the rest. Returns a short report for stderr (empty when there was
-/// nothing to do); `Err` only when nothing could be saved. Never blocks
-/// anything.
+/// `from-compact` note with the same summary) are skipped; when that check
+/// cannot finish, the lines are saved anyway and the report says so. When
+/// Libellus refuses the batch, each line is retried alone so one bad line
+/// does not lose the rest; a batch that timed out or could not run is not
+/// retried. The whole hook stops after `COMPACT_DEADLINE` (30 s) and reports what
+/// it did not save. Returns a short report for stderr (empty when there
+/// was nothing to do); `Err` only when nothing could be saved. Never
+/// blocks anything.
 pub fn post_compact(
     cfg: &Config,
     project: &Path,
@@ -316,6 +446,7 @@ pub fn post_compact(
     if !cfg.brief.save_unrecorded_on_compact {
         return Ok(String::new());
     }
+    let deadline = Instant::now() + COMPACT_DEADLINE;
     let v = mh_json::parse(stdin.trim())
         .map_err(|e| format!("post-compact stdin is not JSON ({})", e.msg))?;
     let summary = v
@@ -344,53 +475,73 @@ pub fn post_compact(
     let agent = cfg.main_agent.as_str();
     let mut report = Vec::new();
     let wanted: Vec<&str> = items.iter().map(|(_, s)| s.as_str()).collect();
-    match saved_from_compact(project, agent, &wanted, timeout, run) {
-        Ok(dups) if !dups.is_empty() => {
-            items.retain(|(_, s)| !dups.contains(s));
-            report.push(format!(
-                "skipped {} item(s) already saved by an earlier compact",
-                dups.len()
-            ));
-        }
-        Ok(_) => {}
-        Err(e) => report.push(format!("could not check for earlier notes ({e})")),
+    let earlier = saved_from_compact(project, agent, &wanted, timeout, deadline, run);
+    if !earlier.found.is_empty() {
+        items.retain(|(_, s)| !earlier.found.contains(s));
+        report.push(format!(
+            "skipped {} item(s) already saved by an earlier compact",
+            earlier.found.len()
+        ));
+    }
+    if let Some(why) = &earlier.incomplete {
+        report.push(format!(
+            "could not check every earlier note ({why}), so some saved below may be repeats"
+        ));
     }
     if items.is_empty() {
         return Ok(report.join("; "));
     }
-    let save = |batch: &[(String, String)]| -> Result<(), String> {
+    let save = |batch: &[(String, String)]| -> Result<(), NoteErr> {
+        let Some(t) = left(deadline, timeout) else {
+            return Err(NoteErr::Failed("out of time".to_string()));
+        };
         let notes = notes_json(batch);
         let args = ["note", "--agent", agent, "--notes", notes.as_str()];
-        match run("libellus", &args, project, timeout) {
+        match run("libellus", &args, project, t) {
             Ok(o) if o.code == Some(0) => Ok(()),
-            Ok(o) => Err(first_line(&o)),
-            Err(e) => Err(e),
+            Ok(o) => Err(NoteErr::Refused(first_line(&o))),
+            Err(e) => Err(NoteErr::Failed(e)),
         }
     };
-    let (saved, failed) = match save(&items) {
-        Ok(()) => (items.len(), Vec::new()),
-        Err(e) if items.len() == 1 => (0, vec![e]),
-        Err(_) => {
-            let mut ok = 0;
-            let mut failed = Vec::new();
-            for it in &items {
+    let mut saved = 0;
+    let mut refused: Vec<String> = Vec::new();
+    // Items not tried at all, and why.
+    let mut skipped: Option<(usize, String)> = None;
+    match save(&items) {
+        Ok(()) => saved = items.len(),
+        Err(NoteErr::Failed(e)) => skipped = Some((items.len(), e)),
+        Err(NoteErr::Refused(e)) if items.len() == 1 => refused.push(e),
+        Err(NoteErr::Refused(_)) => {
+            for (i, it) in items.iter().enumerate() {
                 match save(std::slice::from_ref(it)) {
-                    Ok(()) => ok += 1,
-                    Err(e) => failed.push(e),
+                    Ok(()) => saved += 1,
+                    Err(NoteErr::Refused(e)) => refused.push(e),
+                    Err(NoteErr::Failed(e)) => {
+                        skipped = Some((items.len() - i, e));
+                        break;
+                    }
                 }
             }
-            (ok, failed)
         }
-    };
+    }
     if saved == 0 {
-        return Err(format!("libellus note failed: {}", failed[0]));
+        let why = match (&skipped, refused.first()) {
+            (Some((n, e)), _) => format!("{e}; {n} item(s) not saved"),
+            (None, Some(e)) => e.clone(),
+            (None, None) => "nothing saved".to_string(),
+        };
+        report.insert(0, format!("libellus note failed: {why}"));
+        return Err(report.join("; "));
     }
     report.insert(
         0,
         format!("saved {saved} unrecorded item(s) as Libellus notes tagged {FROM_COMPACT}"),
     );
-    if !failed.is_empty() {
-        report.push(format!("{} item(s) refused: {}", failed.len(), failed[0]));
+    if !refused.is_empty() {
+        report.push(format!("{} item(s) refused: {}", refused.len(), refused[0]));
+    }
+    if let Some((n, e)) = skipped {
+        report.push(format!("{n} item(s) not saved: {e}"));
     }
     Ok(report.join("; "))
 }
@@ -398,8 +549,41 @@ pub fn post_compact(
 /// What the current turn of a transcript did.
 #[derive(Debug, Default, PartialEq)]
 pub struct Turn {
+    /// The read part of the transcript holds the turn's start (a prompt,
+    /// or the feedback of an earlier stop nudge). False when the last
+    /// prompt lies before the part read: the turn is then unknown.
+    pub started: bool,
+    /// An edit tool (`brief.edit_tools`) ran.
     pub edited: bool,
+    /// A shell tool ([`SHELL_TOOLS`]) ran.
+    pub shell: bool,
+    /// A save tool (`brief.save_tools`) ran.
     pub saved: bool,
+}
+
+/// Tools that run shell commands, which can change files the transcript
+/// does not name.
+pub const SHELL_TOOLS: &[&str] = &["Bash", "PowerShell"];
+
+/// The start of the text Claude Code writes back as a user entry when a
+/// Stop or SubagentStop hook blocks.
+const STOP_FEEDBACK: &[&str] = &["Stop hook feedback", "SubagentStop hook feedback"];
+
+/// Whether a user entry is the feedback of a stop nudge. The edits before
+/// it were already asked about, so a turn is counted again from there.
+fn is_stop_feedback(content: &Value) -> bool {
+    let starts = |s: &str| {
+        let t = s.trim_start();
+        STOP_FEEDBACK.iter().any(|p| t.starts_with(p))
+    };
+    match content {
+        Value::Str(s) => starts(s),
+        Value::Array(items) => items.iter().any(|i| {
+            i.get("type").and_then(Value::as_str) == Some("text")
+                && starts(i.get("text").and_then(Value::as_str).unwrap_or(""))
+        }),
+        _ => false,
+    }
 }
 
 /// Tags that open text Claude Code writes into the transcript as a user
@@ -474,9 +658,14 @@ fn is_prompt(v: &Value, content: &Value) -> bool {
 }
 
 /// Read the turn that ends a transcript: everything after the last prompt
-/// (see [`is_prompt`]). Edit and save tools come from `brief`.
+/// (see [`is_prompt`]) or the last stop-nudge feedback, whichever is later.
+/// Edit and save tools come from `brief`.
 pub fn last_turn(jsonl: &str, brief: &BriefConfig) -> Turn {
     let mut turn = Turn::default();
+    let fresh = || Turn {
+        started: true,
+        ..Turn::default()
+    };
     for line in jsonl.lines() {
         let is_user = line.contains("\"type\":\"user\"");
         if !is_user && !line.contains("\"type\":\"assistant\"") {
@@ -490,8 +679,8 @@ pub fn last_turn(jsonl: &str, brief: &BriefConfig) -> Turn {
         };
         match v.get("type").and_then(Value::as_str) {
             Some("user") => {
-                if is_prompt(&v, content) {
-                    turn = Turn::default();
+                if is_prompt(&v, content) || is_stop_feedback(content) {
+                    turn = fresh();
                 }
             }
             Some("assistant") => {
@@ -502,6 +691,7 @@ pub fn last_turn(jsonl: &str, brief: &BriefConfig) -> Turn {
                     let name = item.get("name").and_then(Value::as_str).unwrap_or("");
                     let base = name.rsplit("__").next().unwrap_or(name);
                     turn.edited |= brief.edit_tools.iter().any(|t| t == name);
+                    turn.shell |= SHELL_TOOLS.contains(&name);
                     turn.saved |= brief.save_tools.iter().any(|t| t == base);
                 }
             }
@@ -553,17 +743,35 @@ If the turn settled a decision, rule, convention or dead end, or produced a resu
 }
 
 /// Stop / SubagentStop: the hook's stdout. `{}` lets the agent stop; a
-/// `decision: block` keeps it going once with [`nudge_text`].
+/// `decision: block` keeps it going once with [`nudge_text`]. Commands
+/// (git, for the snapshot) run with [`crate::run_command`].
 pub fn stop(cfg: &Config, project: &Path, stdin: &str, subagent: bool) -> Result<String, String> {
+    stop_with(cfg, project, stdin, subagent, &crate::run_command)
+}
+
+/// [`stop`] with an injectable command runner.
+///
+/// Whether the turn changed files: in a git repository with a baseline
+/// snapshot (see [`crate::snapshot`]), the tree changed since the baseline
+/// and the turn ran an edit or shell tool (so edits the user makes in an
+/// editor while the agent only reads do not count); otherwise an edit tool
+/// ran. Either way, the new snapshot becomes the baseline, whether the
+/// agent is nudged or allowed to stop, so one set of changes is asked about
+/// once. A turn whose start is not in the part of the transcript read is
+/// not judged.
+pub fn stop_with(
+    cfg: &Config,
+    project: &Path,
+    stdin: &str,
+    subagent: bool,
+    run: &Runner,
+) -> Result<String, String> {
     let allow = Ok("{}".to_string());
     if !cfg.brief.nudge_on_stop {
         return allow;
     }
     let v =
         mh_json::parse(stdin.trim()).map_err(|e| format!("stop stdin is not JSON ({})", e.msg))?;
-    if v.get("stop_hook_active").and_then(Value::as_bool) == Some(true) {
-        return allow;
-    }
     // A project with no memory store has not opted in; the brief already
     // says how to set it up.
     let present: Vec<&str> = cfg
@@ -573,6 +781,18 @@ pub fn stop(cfg: &Config, project: &Path, stdin: &str, subagent: bool) -> Result
         .map(|s| s.tool.as_str())
         .collect();
     if present.is_empty() {
+        return allow;
+    }
+    let timeout = Duration::from_secs(cfg.brief.command_timeout_s.max(1));
+    let snap_path = crate::snapshot::path_from(&v, subagent);
+    let baseline = snap_path.as_deref().and_then(crate::snapshot::load);
+    let now = snap_path
+        .as_ref()
+        .and_then(|_| crate::snapshot::take(project, timeout, run));
+    if let (Some(p), Some(n)) = (&snap_path, &now) {
+        crate::snapshot::save(p, n);
+    }
+    if v.get("stop_hook_active").and_then(Value::as_bool) == Some(true) {
         return allow;
     }
     let field = |k: &str| {
@@ -592,7 +812,11 @@ pub fn stop(cfg: &Config, project: &Path, stdin: &str, subagent: bool) -> Result
         return allow;
     }
     let turn = last_turn(&read_tail(Path::new(&path))?, &cfg.brief);
-    if !turn.edited || turn.saved {
+    let edited = match (&now, &baseline) {
+        (Some(n), Some(b)) => n != b && (turn.edited || turn.shell),
+        _ => turn.edited,
+    };
+    if !turn.started || !edited || turn.saved {
         return allow;
     }
     let agent = if subagent {
@@ -994,14 +1218,11 @@ mod tests {
         let keep = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__x__keep"}]}}"#;
         assert_eq!(
             last_turn(&lines(&[PROMPT, EDIT, SAVE]), &b),
-            Turn::default()
+            turn(false, false)
         );
         assert_eq!(
             last_turn(&lines(&[PROMPT, patch, keep]), &b),
-            Turn {
-                edited: true,
-                saved: true
-            }
+            turn(true, true)
         );
     }
 
@@ -1010,6 +1231,15 @@ mod tests {
     const RESULT: &str = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"1","content":"ok"}]}}"#;
     const SAVE: &str = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"2","name":"mcp__mem-harness__libellus_note","input":{}}]}}"#;
     const META: &str = r#"{"type":"user","isMeta":true,"message":{"content":"<reminder>"}}"#;
+
+    fn turn(edited: bool, saved: bool) -> Turn {
+        Turn {
+            started: true,
+            edited,
+            shell: false,
+            saved,
+        }
+    }
 
     fn lt(s: &str) -> Turn {
         last_turn(s, &Config::builtin().brief)
@@ -1021,28 +1251,13 @@ mod tests {
 
     #[test]
     fn last_turn_starts_at_the_last_prompt() {
+        assert_eq!(lt(&lines(&[PROMPT, EDIT, RESULT])), turn(true, false));
+        assert_eq!(lt(&lines(&[PROMPT, EDIT, RESULT, SAVE])), turn(true, true));
         assert_eq!(
-            lt(&lines(&[PROMPT, EDIT, RESULT])),
-            Turn {
-                edited: true,
-                saved: false
-            }
+            lt(&lines(&[PROMPT, EDIT, RESULT, PROMPT])),
+            turn(false, false)
         );
-        assert_eq!(
-            lt(&lines(&[PROMPT, EDIT, RESULT, SAVE])),
-            Turn {
-                edited: true,
-                saved: true
-            }
-        );
-        assert_eq!(lt(&lines(&[PROMPT, EDIT, RESULT, PROMPT])), Turn::default());
-        assert_eq!(
-            lt(&lines(&[PROMPT, EDIT, META])),
-            Turn {
-                edited: true,
-                saved: false
-            }
-        );
+        assert_eq!(lt(&lines(&[PROMPT, EDIT, META])), turn(true, false));
         assert!(lt(&lines(&[PROMPT, "not json", EDIT])).edited);
         let other = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__relatum__relatum_new"}]}}"#;
         assert!(lt(&lines(&[PROMPT, EDIT, other])).saved);

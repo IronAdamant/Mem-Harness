@@ -5,17 +5,18 @@
 //! shell command. The harness owns setup: the brief names missing stores and
 //! `harness_init` creates them in one call. An existing store is never
 //! touched. Which stores exist, where they live and how each is created come
-//! from `Config.stores`, so a new tool needs no code here.
+//! from `Config.stores`, so a new tool needs no code here, unless it treats a
+//! symlinked or file store differently from Relatum (see `Links`).
 
 use crate::run::CmdOut;
 use mh_core::config::StoreSpec;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Where a store stands in a project.
 #[derive(Debug, Clone, PartialEq)]
 pub enum State {
-    /// A real folder.
+    /// A folder the tool uses.
     Present,
     /// Nothing there; `init` creates it.
     Absent,
@@ -24,44 +25,101 @@ pub enum State {
     Refused(String),
 }
 
-fn at(path: &Path, st: &StoreSpec) -> Option<State> {
-    let m = std::fs::symlink_metadata(path).ok()?;
-    Some(if m.is_dir() {
-        State::Present
-    } else {
-        let what = if m.file_type().is_symlink() {
-            "a symlink"
-        } else {
-            "not a folder"
-        };
-        State::Refused(format!(
-            "{} is {what}; {} refuses it. Replace it with a real folder{}",
-            path.display(),
-            st.tool,
-            if st.env.is_empty() {
-                String::new()
-            } else {
-                format!(" or set {}", st.env)
-            }
-        ))
-    })
+/// How a tool treats a store path that is a symlink or a file. Each tool
+/// finds its store its own way, and the harness must agree with it, or the
+/// brief calls a working store refused (or offers to create one the tool
+/// will not use). `StoreSpec` has no field for this, so the rules are kept
+/// here, keyed by tool name; a tool not listed is read as Relatum reads its
+/// store (`Links::Follow`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Links {
+    /// Libellus: the walk up stops at the first entry of that name, and a
+    /// symlink or file there (or at the env var's path) is refused.
+    Refuse,
+    /// Adsertio: the walk up passes a symlink or file and takes the first
+    /// real folder; the env var's path must be a real folder.
+    Skip,
+    /// Relatum: a symlink to a folder is a store (followed); a file is
+    /// walked past. One lookup, `mh_adapters::relatum::store_dir_in`, which
+    /// the brief's rules section uses too.
+    Follow,
 }
 
-/// A store is the folder its env var names, else the nearest `dir` at or
-/// above `project` (each tool walks up the same way and stops at the first
-/// entry it finds, refusing a symlink or file there).
-pub fn state(project: &Path, st: &StoreSpec) -> State {
-    if !st.env.is_empty() {
-        if let Ok(p) = std::env::var(&st.env) {
-            if !p.trim().is_empty() {
-                return at(&project.join(p), st).unwrap_or(State::Absent);
-            }
+fn links(tool: &str) -> Links {
+    match tool {
+        "libellus" => Links::Refuse,
+        "adsertio" => Links::Skip,
+        _ => Links::Follow,
+    }
+}
+
+fn refusal(path: &Path, m: &std::fs::Metadata, st: &StoreSpec) -> String {
+    let what = if m.file_type().is_symlink() {
+        "a symlink"
+    } else {
+        "not a folder"
+    };
+    format!(
+        "{} is {what}; {} refuses it. Replace it with a real folder{}",
+        path.display(),
+        st.tool,
+        if st.env.is_empty() {
+            String::new()
+        } else {
+            format!(" or set {}", st.env)
+        }
+    )
+}
+
+/// The env var's path (relative to `project`), when it is set and not blank.
+fn env_path(project: &Path, st: &StoreSpec) -> Option<PathBuf> {
+    if st.env.is_empty() {
+        return None;
+    }
+    let v = std::env::var_os(&st.env)?;
+    if v.is_empty() || v.to_str().is_some_and(|s| s.trim().is_empty()) {
+        return None;
+    }
+    Some(project.join(v))
+}
+
+/// Find the store the way its tool does: the folder its env var names,
+/// else a `dir` at or above `project` (see `Links`). `Ok(Some(path))` is
+/// a store the tool uses, `Ok(None)` none, `Err` one it refuses.
+pub fn locate(project: &Path, st: &StoreSpec) -> Result<Option<PathBuf>, String> {
+    let rule = links(&st.tool);
+    if rule == Links::Follow {
+        return Ok(mh_adapters::relatum::store_dir_in(
+            project, &st.dir, &st.env,
+        ));
+    }
+    let real = |p: &Path| -> Result<Option<PathBuf>, String> {
+        match std::fs::symlink_metadata(p) {
+            Err(_) => Ok(None),
+            Ok(m) if m.is_dir() => Ok(Some(p.to_path_buf())),
+            Ok(m) => Err(refusal(p, &m, st)),
+        }
+    };
+    if let Some(p) = env_path(project, st) {
+        return real(&p);
+    }
+    for a in project.ancestors() {
+        match real(&a.join(&st.dir)) {
+            Ok(Some(p)) => return Ok(Some(p)),
+            Err(e) if rule == Links::Refuse => return Err(e),
+            _ => {}
         }
     }
-    project
-        .ancestors()
-        .find_map(|a| at(&a.join(&st.dir), st))
-        .unwrap_or(State::Absent)
+    Ok(None)
+}
+
+/// Where the store `st` stands for `project`; see [`locate`].
+pub fn state(project: &Path, st: &StoreSpec) -> State {
+    match locate(project, st) {
+        Ok(Some(_)) => State::Present,
+        Ok(None) => State::Absent,
+        Err(why) => State::Refused(why),
+    }
 }
 
 pub fn exists(project: &Path, st: &StoreSpec) -> bool {

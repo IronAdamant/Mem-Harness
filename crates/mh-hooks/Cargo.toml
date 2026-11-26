@@ -10,3 +10,4 @@ repository.workspace = true
 mh-json = { path = "../mh-json" }
 mh-core = { path = "../mh-core" }
 mh-adapters = { path = "../mh-adapters" }
+mh-sys = { path = "../mh-sys" }

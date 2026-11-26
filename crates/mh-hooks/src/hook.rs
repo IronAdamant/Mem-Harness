@@ -4,6 +4,7 @@ use crate::brief::compose_brief;
 use mh_core::{identity::subagent_name, Config};
 use mh_json::Value;
 use std::path::Path;
+use std::time::Duration;
 
 fn output(event: &str, text: &str) -> String {
     Value::obj(vec![(
@@ -50,19 +51,38 @@ fn subagent_from(stdin: &str) -> Result<String, String> {
 }
 
 /// The events `mem-harness hook` handles.
-pub const EVENTS: &str =
-    "session-start, subagent-start, pre-compact, post-compact, stop or subagent-stop";
+pub const EVENTS: &str = "session-start, prompt-submit, subagent-start, pre-compact, post-compact, stop or subagent-stop";
+
+/// The baseline snapshot for the stop check (see [`crate::snapshot`]),
+/// when the stop check is on and would run (a store exists).
+fn record_baseline(cfg: &Config, project: &Path, stdin: &str, subagent: bool) {
+    let opted_in = cfg.stores.iter().any(|s| crate::stores::exists(project, s));
+    if cfg.brief.nudge_on_stop && opted_in {
+        let timeout = Duration::from_secs(cfg.brief.command_timeout_s.max(1));
+        crate::snapshot::record(project, stdin, subagent, timeout, &crate::run_command);
+    }
+}
 
 /// Handle one hook event and return the one-line JSON for Claude Code's
 /// stdout (no trailing newline).
 pub fn run_hook(cfg: &Config, project: &Path, event: &str, stdin: &str) -> Result<String, String> {
+    // This is the short-lived hook process: orphans of its commands may be
+    // re-parented here, where a timeout can find them.
+    crate::run::adopt_orphans();
     match event {
         "session-start" => Ok(output(
             "SessionStart",
             &compose_brief(cfg, project, &cfg.main_agent),
         )),
+        // UserPromptSubmit: a new turn of the main agent. Its stdout would
+        // be added to the prompt, so it prints only `{}`, and never fails.
+        "prompt-submit" => {
+            record_baseline(cfg, project, stdin, false);
+            Ok("{}".to_string())
+        }
         "subagent-start" => {
             let name = subagent_from(stdin)?;
+            record_baseline(cfg, project, stdin, true);
             let text = format!(
                 "{}\n\n{}",
                 identity_line(&name),
