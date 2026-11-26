@@ -39,8 +39,10 @@ In order, they:
    `claude mcp add --scope user mem-harness -- <path> mcp`, and remove the
    per-tool servers it replaces;
 2. give the `hooks` block to merge into `~/.claude/settings.json`, in place
-   of the Libellus and Adsertio hooks. It wires SessionStart, SubagentStart,
-   PreCompact, PostCompact, Stop and SubagentStop to `mem-harness hook <event>`.
+   of the Libellus and Adsertio hooks. It wires SessionStart,
+   UserPromptSubmit, SubagentStart, PreCompact, PostCompact, Stop and
+   SubagentStop to `mem-harness hook <event>`. If you installed an earlier
+   version, run it again and add the new `UserPromptSubmit` entry.
 
 Restart Claude Code, and `/mcp` should show `mem-harness` connected. Old
 servers or hooks left in place show every tool and the brief twice.
@@ -57,8 +59,13 @@ Two hooks cover what was not saved:
   A line saved by an earlier compact is not saved again, and one line
   Libellus refuses does not lose the others.
 - **When a turn edits files but saves nothing**, the agent is asked once to
-  save its decisions, rules or results before it stops. This costs one extra
-  round trip on such turns. Turn it off with `"nudge_on_stop": false` under
+  save its decisions, rules or results before it stops. In a git
+  repository, edits made with shell commands count too: the hook compares
+  the working tree (as `git status` sees it) with where it stood when the
+  turn began, and counts the change only when the turn ran an edit or shell
+  tool, so your own edits in an editor are not blamed on the agent. Each
+  set of changes is asked about once. Outside git, only the editing tools
+  count. This costs one extra round trip on such turns. Turn it off with `"nudge_on_stop": false` under
   `brief` in `harness.json`; `"save_unrecorded_on_compact": false` turns off
   the other.
 

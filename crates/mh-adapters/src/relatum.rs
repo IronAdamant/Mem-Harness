@@ -43,12 +43,15 @@ pub fn store_dir(project: &Path) -> Option<PathBuf> {
 }
 
 /// The store folder `dir`, moved by the variable `env` (when set and not
-/// empty), else the nearest `dir` at or above `project`.
+/// blank; a relative value is taken from `project`), else the nearest
+/// `dir` at or above `project`. As Relatum itself does, a symlink to a
+/// folder is followed and a file is walked past. The harness's Setup check
+/// (`mh_hooks::stores`) uses this same lookup, so the brief and Setup agree.
 pub fn store_dir_in(project: &Path, dir: &str, env: &str) -> Option<PathBuf> {
     if !env.is_empty() {
         if let Some(v) = std::env::var_os(env) {
-            if !v.is_empty() {
-                let p = PathBuf::from(v);
+            if !v.is_empty() && !v.to_str().is_some_and(|s| s.trim().is_empty()) {
+                let p = project.join(v);
                 return p.is_dir().then_some(p);
             }
         }

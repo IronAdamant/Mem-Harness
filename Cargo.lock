@@ -38,6 +38,7 @@ dependencies = [
  "mh-adapters",
  "mh-core",
  "mh-json",
+ "mh-sys",
 ]
 
 [[package]]

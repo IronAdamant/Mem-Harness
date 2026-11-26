@@ -13,8 +13,9 @@ mem-harness: one MCP server and one set of hooks for the suite tools
 
 Usage:
   mem-harness mcp                       serve MCP on stdio (what Claude Code starts)
-  mem-harness hook <event>              run a Claude Code hook; event: session-start | subagent-start |
-                                        pre-compact | post-compact | stop | subagent-stop
+  mem-harness hook <event>              run a Claude Code hook; event: session-start | prompt-submit |
+                                        subagent-start | pre-compact | post-compact | stop |
+                                        subagent-stop
   mem-harness brief [--agent NAME]      print the merged compaction brief
   mem-harness init                      create the Relatum, Libellus and Adsertio stores here if missing
   mem-harness ownership                 print who owns each feature and what is hidden where
@@ -339,6 +340,7 @@ const HOOKS: &[(&str, Option<&str>, &str)] = &[
         Some("startup|resume|clear|compact"),
         "session-start",
     ),
+    ("UserPromptSubmit", None, "prompt-submit"),
     ("SubagentStart", None, "subagent-start"),
     ("PreCompact", None, "pre-compact"),
     ("PostCompact", None, "post-compact"),

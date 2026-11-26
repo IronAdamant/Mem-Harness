@@ -17,6 +17,20 @@ Fixes from a second adversarial review (30 confirmed, 15 plausible findings), an
 - `Value::obj` with a repeated key keeps one entry, as parsing does.
 - `print-config` and the usage text point at `~/.mem-harness/harness.json` and list `MEM_HARNESS_PROFILE`.
 
+**Hooks**
+- New hook event `prompt-submit` (UserPromptSubmit; `mem-harness install` wires it). It prints `{}` and records where the working tree stands, so the stop check sees edits made with shell commands too. Re-run `mem-harness install` and merge the new `UserPromptSubmit` entry.
+- The stop check, in a git repository: the turn edited files when the tree changed since the turn began (git `HEAD`, `git status` and each listed file's size and time) and the turn ran an edit or shell tool. Edits you make in your editor while the agent only reads are not blamed on it. Outside git it still goes by the edit tools in the transcript.
+- The stop nudge is asked once per set of changes. It used to repeat on every later turn started by a background task or a sub-agent's hand-back, for edits it had already asked about.
+- The stop check lets the agent stop when the last prompt is older than the part of the transcript it reads, instead of judging a turn it cannot see.
+- PostCompact retries line by line only when Libellus refused the batch, not after a timeout, and the whole hook stops after 30 seconds, reporting what it did not save. A hanging Libellus used to keep it waiting about 220 seconds.
+- PostCompact reads earlier notes page by page, so the duplicate check works in a store of any size (it was skipped once the listing passed 4 MB), and makes at most 40 `libellus get` calls. When the check cannot finish, the lines are saved anyway and the report says so.
+- Lines in the "Not yet recorded" list that end in a colon, and bold sub-headings in it, no longer end the list. A line starting with a note kind and a colon is always an item.
+- A text section's output and Chisel's issue lines can no longer start a heading in the brief (`## x` is shown as `[##] x`); control characters are dropped. Libellus, Relatum and Adsertio output is unchanged.
+- A symlinked `.swarmnotes`, which Relatum uses, is no longer called refused. Each tool's own rule applies: Libellus refuses a symlink or file, Adsertio walks past one, Relatum follows a symlink. The brief's rules and its Setup section use the same lookup.
+- The trim marker names the section's `tool` (`chisel_issues`, not `issues`).
+- A section with a small weight keeps its heading and trim marker instead of vanishing when space is short.
+- Hook command timeouts signal through `mh-sys`, so they no longer need a `kill` binary. A process that left the command's group (`setsid`) is found before the kill and stopped too; on Linux the hook process is a subreaper, so one that double-forked out is found as well.
+
 ## 0.3.0
 
 Fixes from a full adversarial review (32 findings, 28 reproduced with failing tests), and room for new tools.
