@@ -71,7 +71,7 @@ fn no_args(rest: &[String]) -> Result<(), String> {
 }
 
 fn load() -> Result<(PathBuf, Config), String> {
-    let root = project::root();
+    let root = project::root()?;
     let cfg = Config::load(&root)?;
     Ok((root, cfg))
 }
@@ -128,6 +128,7 @@ fn natives(root: &Path, cfg: &Config) -> Vec<mh_proxy::NativeTool> {
         }),
     };
     let init_root = root.to_path_buf();
+    let init_stores = cfg.stores.clone();
     let init = mh_proxy::NativeTool {
         def: Value::obj(vec![
             ("name", Value::str("harness_init")),
@@ -139,13 +140,13 @@ fn natives(root: &Path, cfg: &Config) -> Vec<mh_proxy::NativeTool> {
             ),
             ("inputSchema", schema(vec![], &[])),
         ]),
-        run: Arc::new(move |_args: Value| Ok(text_result(init_report(&init_root)))),
+        run: Arc::new(move |_args: Value| Ok(text_result(init_report(&init_root, &init_stores)))),
     };
     vec![brief, init]
 }
 
-fn init_report(root: &Path) -> String {
-    let out = mh_hooks::stores::init(root, &mh_hooks::run_command);
+fn init_report(root: &Path, stores: &[config::StoreSpec]) -> String {
+    let out = mh_hooks::stores::init(stores, root, &mh_hooks::run_command);
     let rows: Vec<Value> = out
         .iter()
         .map(|(tool, outcome)| {
@@ -163,8 +164,8 @@ fn init_report(root: &Path) -> String {
 }
 
 fn cmd_init() -> Result<(), String> {
-    let (root, _) = load()?;
-    let out = mh_hooks::stores::init(&root, &mh_hooks::run_command);
+    let (root, cfg) = load()?;
+    let out = mh_hooks::stores::init(&cfg.stores, &root, &mh_hooks::run_command);
     let mut failed = false;
     for (tool, outcome) in &out {
         failed |= outcome.starts_with("failed");
@@ -195,7 +196,12 @@ fn cmd_hook(rest: &[String]) -> ExitCode {
     };
     let mut stdin = String::new();
     let _ = std::io::stdin().take(1 << 20).read_to_string(&mut stdin);
-    match load().and_then(|(root, cfg)| mh_hooks::run_hook(&cfg, &root, event, &stdin)) {
+    // A hook never stops the session, even if something panics.
+    let ran = std::panic::catch_unwind(|| {
+        load().and_then(|(root, cfg)| mh_hooks::run_hook(&cfg, &root, event, &stdin))
+    })
+    .unwrap_or_else(|_| Err("internal error (panic); please report it".to_string()));
+    match ran {
         Ok(out) => {
             let mut so = std::io::stdout();
             let _ = so.write_all(out.as_bytes());
@@ -249,6 +255,22 @@ fn cmd_ownership() -> Result<(), String> {
                 hidden.join(",")
             }
         );
+        if !b.hide_tools.is_empty() {
+            println!(
+                "  {:<9} {:<25} {}",
+                "",
+                "proxy hides",
+                b.hide_tools.join(",")
+            );
+        }
+        if !b.only_tools.is_empty() {
+            println!(
+                "  {:<9} {:<25} {}",
+                "",
+                "proxy shows only",
+                b.only_tools.join(",")
+            );
+        }
     }
     if !cfg.routes.is_empty() {
         println!("\nRoutes:");
@@ -264,7 +286,13 @@ fn cmd_doctor(rest: &[String]) -> ExitCode {
         eprintln!("mem-harness doctor: {e}");
         return ExitCode::from(2);
     }
-    let root = project::root();
+    let root = match project::root() {
+        Ok(r) => r,
+        Err(e) => {
+            println!("FAIL project: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     println!("project: {}", root.display());
     let cfg = match Config::load(&root) {
         Ok(c) => {
@@ -281,7 +309,7 @@ fn cmd_doctor(rest: &[String]) -> ExitCode {
         println!("warn project: no .git here; Chisel, Probatio and Trammel's ref checks need a git repository");
     }
     for b in &cfg.backends {
-        match project::find_command(&b.command) {
+        match project::find_command(&b.command, &root) {
             Some(p) => println!("ok   {:<9} {}", b.name, p.display()),
             None => {
                 ok = false;
@@ -289,15 +317,10 @@ fn cmd_doctor(rest: &[String]) -> ExitCode {
             }
         }
     }
-    for (cli, needs) in [
-        ("libellus", "the brief, init and post-compact notes"),
-        ("adsertio", "the brief and init"),
-        ("chisel", "the brief"),
-        ("relatum", "init"),
-    ] {
-        if project::find_command(cli).is_none() {
+    for (cli, needs) in cfg.cli_commands() {
+        if project::find_command(&cli, &root).is_none() {
             ok = false;
-            println!("FAIL cli      `{cli}` not found; {needs} need it");
+            println!("FAIL cli      `{cli}` not found; needed by {needs}");
         }
     }
     if ok {
@@ -350,16 +373,68 @@ fn cmd_install() -> Result<(), String> {
                 .collect(),
         ),
     )]);
-    println!("# 0. Back up both files first (Roll back in the README restores these):");
-    println!("stamp=$(date +%Y%m%d-%H%M%S)");
-    println!("cp ~/.claude.json ~/.claude.json.bak-mem-harness-$stamp");
-    println!("cp ~/.claude/settings.json ~/.claude/settings.json.bak-mem-harness-$stamp\n");
-    println!("# 1. Add the MCP server for every project (writes ~/.claude.json):");
-    println!("claude mcp add --scope user mem-harness -- '{exe}' mcp\n");
+    if cfg!(windows) {
+        let q = ps_quote(&exe);
+        println!(
+            "# 0. Back up both files first (PowerShell; Roll back in the README restores these):"
+        );
+        println!("$stamp = Get-Date -Format yyyyMMdd-HHmmss");
+        println!(
+            "Copy-Item \"$HOME\\.claude.json\" \"$HOME\\.claude.json.bak-mem-harness-$stamp\""
+        );
+        println!("Copy-Item \"$HOME\\.claude\\settings.json\" \"$HOME\\.claude\\settings.json.bak-mem-harness-$stamp\"\n");
+        println!("# 1. Add the MCP server for every project (writes ~/.claude.json):");
+        println!("claude mcp add --scope user mem-harness -- {q} mcp\n");
+    } else {
+        let q = sh_quote(&exe);
+        println!("# 0. Back up both files first (Roll back in the README restores these):");
+        println!("stamp=$(date +%Y%m%d-%H%M%S)");
+        println!("cp ~/.claude.json ~/.claude.json.bak-mem-harness-$stamp");
+        println!("cp ~/.claude/settings.json ~/.claude/settings.json.bak-mem-harness-$stamp\n");
+        println!("# 1. Add the MCP server for every project (writes ~/.claude.json):");
+        println!("claude mcp add --scope user mem-harness -- {q} mcp\n");
+    }
     println!("#    and remove the per-tool servers it replaces, for example:");
     println!("#    claude mcp remove --scope user libellus   (likewise relatum, adsertio, chisel, ...)\n");
     println!("# 2. Merge this into ~/.claude/settings.json, replacing the Libellus and Adsertio hooks:\n{}\n", hooks.to_json());
     println!("# 3. Restart Claude Code; /mcp should show mem-harness connected.");
     println!("#    Old servers or hooks left in place show every tool and the brief twice.");
     Ok(())
+}
+
+/// Quote for a POSIX shell: `'...'`, with each `'` written `'\''`.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Quote for PowerShell: `'...'`, with each `'` doubled.
+fn ps_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quoting_survives_quotes_and_spaces() {
+        assert_eq!(sh_quote("/a b/c"), "'/a b/c'");
+        assert_eq!(sh_quote("/it's/x"), "'/it'\\''s/x'");
+        assert_eq!(ps_quote("C:\\it's"), "'C:\\it''s'");
+    }
+
+    #[test]
+    fn sh_quote_round_trips_through_a_shell() {
+        if cfg!(windows) {
+            return;
+        }
+        for s in ["/it's here/x", "a\"b$c`d", "'; touch pwned; '"] {
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("printf %s {}", sh_quote(s)))
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), s);
+        }
+    }
 }

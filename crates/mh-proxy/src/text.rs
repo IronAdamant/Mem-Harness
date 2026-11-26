@@ -70,7 +70,8 @@ pub fn status_def() -> Value {
             "description",
             Value::str(
                 "Mem-Harness state as JSON: per backend whether it is up, how often it started, its last error, \
-                 server name and version, how many tools it exposes and what the ownership table hides there; \
+                 server name and version, how many tools it exposes, what the ownership table hides there, \
+                 how many tools the harness hid (hide_tools/only_tools) and which disabled tools it still lists (ignored_disable); \
                  plus the ownership table and where the config came from. Call it when a tool is missing or fails.",
             ),
         ),
@@ -100,6 +101,13 @@ pub fn unavailable(tool: &str, backend: &str, why: &str) -> String {
         "{tool} failed: backend \"{backend}\" is unavailable: {why}. \
          Fix: make sure its server is installed and on PATH (run `mem-harness doctor`); \
          harness_status shows its state. The next call starts it again."
+    )
+}
+
+pub fn panicked(tool: &str, backend: &str, why: &str) -> String {
+    format!(
+        "{tool} failed: the harness's client for backend \"{backend}\" panicked: {why}. \
+         This is a bug; retry once, and check harness_status."
     )
 }
 

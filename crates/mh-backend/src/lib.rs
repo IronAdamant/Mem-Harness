@@ -122,6 +122,10 @@ pub fn build(
 ) -> Result<Arc<dyn Backend>, String> {
     match spec.kind.as_str() {
         "stdio-mcp" => Ok(Arc::new(stdio::StdioBackend::new(spec, env, project, sink))),
-        other => Err(format!("backend {:?}: unknown kind {other:?}", spec.name)),
+        other => Err(format!(
+            "backend {:?}: unknown kind {other:?} (known: {})",
+            spec.name,
+            mh_core::config::KNOWN_KINDS.join(", ")
+        )),
     }
 }

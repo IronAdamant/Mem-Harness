@@ -54,6 +54,8 @@ Two hooks cover what was not saved:
 - **Before a compact**, the summary is asked to end with a
   `## Not yet recorded` list. After the compact those lines are saved as
   Libellus notes tagged `from-compact`, so they also reach later sessions.
+  A line saved by an earlier compact is not saved again, and one line
+  Libellus refuses does not lose the others.
 - **When a turn edits files but saves nothing**, the agent is asked once to
   save its decisions, rules or results before it stops. This costs one extra
   round trip on such turns. Turn it off with `"nudge_on_stop": false` under
@@ -90,12 +92,54 @@ In a session, `harness_status` shows each backend's state and errors, and
 
 ## Configure
 
-Copy `mem-harness print-config` to `<project>/.mem-harness/harness.json` (or
-point `MEM_HARNESS_CONFIG` at a file) and edit it there. The ownership table
-decides which tool owns a feature, and each backend's `*_DISABLE` variable is
-computed from it. The `lean` profile is the default. Set
-`MEM_HARNESS_PROFILE=full` (or `"profile": "full"`) to show every non-duplicate
-tool.
+The config is read in three layers:
+
+1. **Yours:** `$MEM_HARNESS_CONFIG`, else `~/.mem-harness/harness.json`, else
+   the built-in one (`mem-harness print-config` prints it). Only this layer
+   may name commands: `backends`, `stores` and `brief_sections`.
+2. **The project's:** `<project>/.mem-harness/harness.json`, laid over yours.
+   Claude Code may open any repository, so this file may set only `profile`,
+   `profiles`, `brief`, `main_agent`, `routes` and `ownership`. Anything else
+   is refused with an error.
+3. **`MEM_HARNESS_PROFILE`** picks the profile. `lean` is the default, and
+   `full` shows every tool that is not a duplicate.
+
+The ownership table decides which tool owns a feature, and each backend's
+`*_DISABLE` variable is computed from it. A trim that cannot take effect is
+an error: for example a trim on a backend with no `disable_env`, or one that
+would hide a feature from its owner.
+
+### Adding a tool or a third-party MCP server
+
+Add a backend to your own config. A server that runs over stdio needs only
+this:
+
+```json
+{ "name": "docs", "command": "npx", "args": ["-y", "some-mcp-server"],
+  "handshake_s": 60, "env_pass": ["SOME_API_KEY"], "hide_tools": ["delete_*"] }
+```
+
+Its tools appear as `docs_<tool>`. The optional settings:
+
+| Setting | Does |
+|---|---|
+| `handshake_s` | how long to wait for it to start (default 20) |
+| `call_s` | the cap on one call (default 3600) |
+| `env_pass` | gives it only the basic system variables plus these, instead of your whole environment. Use it for servers you did not write. |
+| `hide_tools` / `only_tools` | the proxy hides tools itself, so this works for servers that have no `*_DISABLE` variable. A pattern matches the server's own tool name, or that name after `strip_prefix`. `*` is a wildcard. |
+
+A remote server works through a stdio bridge such as `mcp-remote`. The
+harness has no dependencies, and Rust's standard library has no TLS, so it
+does not speak HTTPS itself.
+
+To add the tool's output to the brief, add an entry to `brief_sections`:
+
+```json
+{ "name": "docs_status", "parse": "text", "heading": "## Docs", "command": "docs-cli", "args": ["status", "--agent", "{agent}"], "weight": 10 }
+```
+
+If the tool keeps a store that `mem-harness init` should create, add it to
+`stores`.
 
 ## Roll back
 

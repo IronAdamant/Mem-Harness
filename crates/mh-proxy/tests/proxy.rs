@@ -21,6 +21,8 @@ struct Fake {
     name: String,
     tools: Mutex<Vec<Value>>,
     fail_start: Option<String>,
+    /// `start` fails this many more times, then succeeds.
+    flaky_starts: AtomicU32,
     /// When set, `start` blocks until it is opened.
     gate: Option<Arc<(Mutex<bool>, Condvar)>>,
     calls: Mutex<Vec<(String, Value, Option<Value>)>>,
@@ -28,6 +30,12 @@ struct Fake {
     release: AtomicBool,
     saw_cancel: AtomicBool,
     shut: AtomicBool,
+    /// `start` was entered (before the gate).
+    entered: AtomicBool,
+    /// `start` finished (past the gate).
+    started: AtomicBool,
+    /// `shutdown` ran after `start` finished.
+    shut_after_start: AtomicBool,
 }
 
 fn tool(name: &str) -> Value {
@@ -59,12 +67,21 @@ impl Backend for Fake {
         &self.name
     }
     fn start(&self) -> Result<(), CallError> {
+        self.entered.store(true, Ordering::SeqCst);
         if let Some(g) = &self.gate {
             let mut open = g.0.lock().unwrap();
             while !*open {
                 open = g.1.wait(open).unwrap();
             }
         }
+        if self
+            .flaky_starts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(CallError::Timeout("no initialize reply within 30 s".into()));
+        }
+        self.started.store(true, Ordering::SeqCst);
         match &self.fail_start {
             Some(e) => Err(CallError::Unavailable(e.clone())),
             None => Ok(()),
@@ -138,6 +155,7 @@ impl Backend for Fake {
                 "its process crashed; reinstall it".into(),
             )),
             "late" => Err(CallError::Timeout("no reply in 600 s".into())),
+            "panic" => panic!("bug in backend"),
             _ => {
                 let meta = meta.unwrap_or(Value::Null);
                 text(format!(
@@ -148,6 +166,9 @@ impl Backend for Fake {
     }
     fn shutdown(&self) {
         self.shut.store(true, Ordering::SeqCst);
+        if self.started.load(Ordering::SeqCst) {
+            self.shut_after_start.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -386,11 +407,11 @@ fn native(
 fn initialize_negotiates_the_version() {
     let (a, r, b) = three();
     let h = start(vec![], vec![a, r, b]);
-    let v = h.request(1, "initialize", r#"{"protocolVersion":"2025-03-26"}"#);
+    let v = h.request(1, "initialize", r#"{"protocolVersion":"2024-11-05"}"#);
     let res = v.get("result").unwrap();
     assert_eq!(
         res.get("protocolVersion").unwrap().as_str(),
-        Some("2025-03-26")
+        Some("2024-11-05")
     );
     assert_eq!(
         res.get("serverInfo").unwrap().get("name").unwrap().as_str(),
@@ -407,15 +428,26 @@ fn initialize_negotiates_the_version() {
     );
     assert!(ins.contains("compaction"));
 
-    let v = h.request(2, "initialize", r#"{"protocolVersion":"1999-01-01"}"#);
-    assert_eq!(
-        v.get("result")
-            .unwrap()
-            .get("protocolVersion")
-            .unwrap()
-            .as_str(),
-        Some("2025-06-18")
-    );
+    // Unknown, and 2025-03-26 (it needs batches, which are not taken):
+    // the newest supported.
+    for (id, asked) in [(2, "1999-01-01"), (5, "2025-03-26")] {
+        let v = h.request(
+            id,
+            "initialize",
+            &format!(r#"{{"protocolVersion":"{asked}"}}"#),
+        );
+        assert_eq!(
+            v.get("result")
+                .unwrap()
+                .get("protocolVersion")
+                .unwrap()
+                .as_str(),
+            Some(mh_proxy::PROTOCOL_VERSIONS[0]),
+            "{asked}"
+        );
+    }
+    assert_eq!(mh_proxy::PROTOCOL_VERSIONS[0], "2025-11-25");
+    assert!(!mh_proxy::PROTOCOL_VERSIONS.contains(&"2025-03-26"));
     let v = h.request(3, "initialize", r#"{"protocolVersion":"2025-11-25"}"#);
     assert_eq!(
         v.get("result")
@@ -432,7 +464,7 @@ fn initialize_negotiates_the_version() {
     // The initialized notification gets no reply.
     h.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
     let out = h.finish();
-    assert_eq!(out.len(), 4, "{out:?}");
+    assert_eq!(out.len(), 5, "{out:?}");
 }
 
 #[test]
@@ -462,7 +494,7 @@ fn tools_list_merges_and_prefixes() {
     ];
     let h = start(natives, vec![a, r, b]);
     h.init();
-    let v = h.request(1, "tools/list", r#"{"cursor":"ignored"}"#);
+    let v = h.request(1, "tools/list", r#"{"cursor":null}"#);
     let tools = v
         .get("result")
         .unwrap()
@@ -818,6 +850,38 @@ fn first_list_waits_for_a_slow_start_without_blocking_input() {
     assert!(!out.iter().any(|v| v.get("method").is_some()), "{out:?}");
 }
 
+/// A backend still starting when input ends is stopped once its start
+/// finishes, so no server outlives the harness.
+#[test]
+fn a_backend_that_finishes_starting_during_shutdown_is_stopped() {
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let slow = Arc::new(Fake {
+        gate: Some(gate.clone()),
+        ..Fake::new("beta", &["echo"])
+    });
+    let (a, r, _) = three();
+    let h = start(vec![], vec![a, r, slow.clone()]);
+    h.init();
+    // The startup fetch must be inside `start` (past its closing check)
+    // before input ends; otherwise it rightly never starts at all.
+    slow.wait_until("start entered", || slow.entered.load(Ordering::SeqCst));
+    let opener = {
+        let gate = gate.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+        })
+    };
+    h.finish();
+    opener.join().unwrap();
+    assert!(slow.started.load(Ordering::SeqCst));
+    assert!(
+        slow.shut_after_start.load(Ordering::SeqCst),
+        "the backend started after shutdown and was never stopped"
+    );
+}
+
 #[test]
 fn eof_shuts_backends_down() {
     let (a, r, b) = three();
@@ -838,4 +902,239 @@ fn eof_shuts_backends_down() {
         .find(|v| v.get("id").map(Value::to_json).as_deref() == Some("9"))
         .expect("reply to 9");
     assert!(is_error(v));
+}
+
+// ---------- regressions from the adversarial review ----------
+
+fn is_list_changed(v: &Value) -> bool {
+    v.get("method").and_then(Value::as_str) == Some("notifications/tools/list_changed")
+}
+
+fn status_of(h: &Harness, id: i64, backend: &str) -> Value {
+    let v = h.request(id, "tools/call", r#"{"name":"harness_status"}"#);
+    let st = parse(&text_of(&v)).unwrap();
+    st.get("backends")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b.get("name").unwrap().as_str() == Some(backend))
+        .unwrap()
+        .clone()
+}
+
+/// A backend whose first start fails is fetched again by a call under its
+/// prefix: the call is routed and the client hears list_changed.
+#[test]
+fn failed_first_start_is_retried_by_a_call() {
+    let (a, r, _) = three();
+    let beta = Arc::new(Fake::new("beta", &["echo"]));
+    beta.flaky_starts.store(1, Ordering::SeqCst);
+    let h = start(vec![], vec![a, r, beta.clone()]);
+    h.init();
+    assert!(!h.tool_names(1).contains(&"beta_echo".to_string()));
+    let v = h.request(2, "tools/call", r#"{"name":"beta_echo"}"#);
+    assert!(text_of(&v).contains(r#""tool":"echo""#), "{}", v.to_json());
+    h.wait("list_changed", is_list_changed);
+    assert!(h.tool_names(3).contains(&"beta_echo".to_string()));
+    assert_eq!(
+        status_of(&h, 4, "beta").get("state").unwrap().as_str(),
+        Some("up")
+    );
+    h.finish();
+}
+
+/// Without any call, the retry timer brings the backend back.
+#[test]
+fn failed_first_start_is_retried_by_the_timer() {
+    let (a, r, _) = three();
+    let beta = Arc::new(Fake::new("beta", &["echo"]));
+    beta.flaky_starts.store(1, Ordering::SeqCst);
+    let h = start(vec![], vec![a, r, beta.clone()]);
+    h.init();
+    assert!(!h.tool_names(1).contains(&"beta_echo".to_string()));
+    h.wait("list_changed", is_list_changed);
+    assert!(h.tool_names(2).contains(&"beta_echo".to_string()));
+    let out = h.finish();
+    assert_eq!(out.iter().filter(|v| is_list_changed(v)).count(), 1);
+}
+
+/// A call under a backend that keeps failing tries it again and says why.
+#[test]
+fn call_under_a_failing_backend_reports_its_error() {
+    let (a, r, _) = three();
+    let beta = Arc::new(Fake::new("beta", &["echo"]));
+    beta.flaky_starts.store(1000, Ordering::SeqCst);
+    let h = start(vec![], vec![a, r, beta.clone()]);
+    h.init();
+    h.tool_names(1);
+    let before = beta.flaky_starts.load(Ordering::SeqCst);
+    let v = h.request(2, "tools/call", r#"{"name":"beta_echo"}"#);
+    let e = v.get("error").unwrap();
+    assert_eq!(e.get("code").unwrap().as_i64(), Some(-32602));
+    let m = e.get("message").unwrap().as_str().unwrap();
+    assert!(
+        m.contains("backend \"beta\" failed") && m.contains("no initialize reply"),
+        "{m}"
+    );
+    assert!(
+        beta.flaky_starts.load(Ordering::SeqCst) < before,
+        "not retried"
+    );
+    h.finish();
+}
+
+/// A panic in a backend's call_tool is an isError result, and the proxy
+/// keeps serving.
+#[test]
+fn backend_panic_is_an_error_result() {
+    let (_, r, b) = three();
+    let alpha = Arc::new(Fake::new("alpha", &["panic", "echo"]));
+    let h = start(vec![], vec![alpha, r, b]);
+    h.init();
+    h.tool_names(1);
+    let v = h.request(42, "tools/call", r#"{"name":"alpha_panic"}"#);
+    assert!(is_error(&v), "{}", v.to_json());
+    let t = text_of(&v);
+    assert!(
+        t.contains("panicked") && t.contains("bug in backend"),
+        "{t}"
+    );
+    let v = h.request(43, "tools/call", r#"{"name":"alpha_echo"}"#);
+    assert!(text_of(&v).contains("echo"));
+    h.finish();
+}
+
+/// `hide_tools` hides a backend's tool in the proxy: not listed, and a call
+/// gets the unknown-tool error. A disabled tool the backend still lists is
+/// flagged in harness_status.
+#[test]
+fn hide_tools_hides_and_ignored_disable_is_flagged() {
+    let text = CONFIG.replace(
+        r#""command": "beta-mcp","#,
+        r#""command": "beta-mcp", "hide_tools": ["sec*"],"#,
+    );
+    let cfg = Config::from_json(&text, "test.json").unwrap();
+    let (a, r, _) = three();
+    let beta = Arc::new(Fake::new(
+        "beta",
+        &["echo", "take_lock", "secret", "second"],
+    ));
+    let h = start_cfg(cfg, vec![], vec![a, r, beta.clone()]);
+    h.init();
+    let names = h.tool_names(1);
+    assert!(names.contains(&"beta_echo".to_string()), "{names:?}");
+    assert!(
+        !names.iter().any(|n| n.starts_with("beta_sec")),
+        "{names:?}"
+    );
+    let v = h.request(2, "tools/call", r#"{"name":"beta_secret"}"#);
+    let e = v.get("error").unwrap();
+    assert_eq!(e.get("code").unwrap().as_i64(), Some(-32602));
+    let m = e.get("message").unwrap().as_str().unwrap();
+    assert!(m.starts_with("unknown tool \"beta_secret\""), "{m}");
+    assert!(beta.calls.lock().unwrap().is_empty());
+    let st = status_of(&h, 3, "beta");
+    assert_eq!(st.get("hidden").unwrap().as_i64(), Some(2));
+    assert_eq!(st.get("tools").unwrap().as_i64(), Some(2));
+    assert_eq!(
+        st.get("ignored_disable").unwrap().to_json(),
+        r#"["take_lock"]"#
+    );
+    let alpha = status_of(&h, 4, "alpha");
+    assert_eq!(alpha.get("ignored_disable").unwrap().to_json(), "[]");
+    assert_eq!(alpha.get("hidden").unwrap().as_i64(), Some(0));
+    h.finish();
+}
+
+/// `only_tools` matches the backend's own name, before the prefix is stripped.
+#[test]
+fn only_tools_matches_the_own_name() {
+    let text = CONFIG.replace(
+        r#""strip_prefix": "relatum_""#,
+        r#""strip_prefix": "relatum_", "only_tools": ["relatum_g*"]"#,
+    );
+    let cfg = Config::from_json(&text, "test.json").unwrap();
+    let (a, r, b) = three();
+    let h = start_cfg(cfg, vec![], vec![a, r, b]);
+    h.init();
+    let names = h.tool_names(1);
+    let rel: Vec<&String> = names.iter().filter(|n| n.starts_with("relatum_")).collect();
+    assert_eq!(rel, ["relatum_get"], "{names:?}");
+    h.finish();
+}
+
+/// An id without method, result or error is an invalid request; a response
+/// (result or error) is ignored.
+#[test]
+fn request_without_method_is_rejected() {
+    let h = start(vec![], vec![]);
+    h.init();
+    h.send(r#"{"jsonrpc":"2.0","id":5,"params":{}}"#);
+    let v = h.reply("5");
+    assert_eq!(
+        v.get("error").unwrap().get("code").unwrap().as_i64(),
+        Some(-32600)
+    );
+    h.send(r#"{"jsonrpc":"2.0","id":7,"result":{}}"#);
+    h.send(r#"{"jsonrpc":"2.0","id":8,"error":{"code":1,"message":"x"}}"#);
+    h.request(6, "ping", "{}");
+    let out = h.finish();
+    // initialize, the -32600, the ping.
+    assert_eq!(out.len(), 3, "{out:?}");
+}
+
+/// Ids of every legal shape come back verbatim.
+#[test]
+fn ids_are_verbatim() {
+    let h = start(vec![], vec![]);
+    for id in [
+        r#""x\"y""#,
+        "12345678901234567890",
+        "1.0",
+        "-0",
+        "1e3",
+        "null",
+    ] {
+        h.send(&format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#));
+        h.reply(id);
+    }
+    h.finish();
+}
+
+/// We never issue cursors, so any cursor is invalid.
+#[test]
+fn bogus_cursor_is_rejected() {
+    let h = start(vec![], vec![]);
+    h.init();
+    let v = h.request(1, "tools/list", r#"{"cursor":"bogus"}"#);
+    assert_eq!(
+        v.get("error").unwrap().get("code").unwrap().as_i64(),
+        Some(-32602),
+        "{}",
+        v.to_json()
+    );
+    h.finish();
+}
+
+/// A line over the cap is answered -32700 (id null) and skipped; the next
+/// line is served.
+#[test]
+fn over_long_line_is_skipped() {
+    let h = start(vec![], vec![]);
+    let tx = h.tx.as_ref().unwrap();
+    tx.send(br#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{"pad":""#.to_vec())
+        .unwrap();
+    let chunk = vec![b' '; 1 << 20];
+    for _ in 0..=(mh_proxy::MAX_LINE >> 20) {
+        tx.send(chunk.clone()).unwrap();
+    }
+    tx.send(b"\"}}\n".to_vec()).unwrap();
+    h.request(2, "ping", "{}");
+    let out = h.finish();
+    assert_eq!(out.len(), 2, "{out:?}");
+    let e = out[0].get("error").unwrap();
+    assert_eq!(e.get("code").unwrap().as_i64(), Some(-32700));
+    assert!(out[0].get("id").unwrap().is_null());
+    assert_eq!(out[1].get("id").unwrap().to_json(), "2");
 }

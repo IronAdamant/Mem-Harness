@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased
+
+Fixes from a full adversarial review (32 findings, 28 reproduced with failing tests), and room for new tools.
+
+**Security**
+- A project's `.mem-harness/harness.json` can no longer name commands. It is now an overlay limited to `profile`, `profiles`, `brief`, `main_agent`, `routes` and `ownership`. `backends`, `stores` and `brief_sections` come only from `$MEM_HARNESS_CONFIG` or `~/.mem-harness/harness.json`. **If you kept a full config in a project, move it to `~/.mem-harness/harness.json`.**
+- `env_pass` gives a backend only the basic system variables plus the ones listed, not your whole environment.
+- `install` quotes the binary path for sh and PowerShell.
+- The release workflow checks the tag against the version, runs the tests, and only the publishing job may write.
+
+**Reliability**
+- **Backends:**
+  - one writer thread per server, so a stalled pipe can no longer block calls past their time limit or hang shutdown;
+  - an exit is noticed even while a child the server started holds its output;
+  - no "broken pipe" errors in the moment after a server exits;
+  - output lines are capped;
+  - a server that hangs at startup now counts toward the restart guard.
+- **Proxy:**
+  - a backend that failed to start is retried (on a call, on `tools/list` and on a backoff), and `list_changed` is sent when its tools appear;
+  - a backend panic answers the call with an error;
+  - a backend still starting when the harness exits is stopped once its start finishes;
+  - a request with an id but no method gets -32600, and a bad cursor gets -32602;
+  - an unknown protocol version gets the newest one; 2025-03-26 is dropped;
+  - stdin lines are capped.
+- **Hooks:**
+  - command timeouts hold even when a command leaves a process behind (on Unix the process group gets TERM, then KILL);
+  - `MEM_HARNESS_PROFILE` typos are reported instead of crashing;
+  - a hook never exits non-zero.
+- **Memory hooks:**
+  - unsaved items are cleaned of control characters, and retried one by one if the batch is refused;
+  - items saved by an earlier compact are skipped;
+  - the "Not yet recorded" list is found under any heading level, as a numbered or bold label, and outside code blocks;
+  - task notifications, system reminders and other injected entries no longer count as a new prompt in the stop check;
+  - the nudge names only the save tools whose store exists;
+  - a symlinked store is reported, not used.
+
+**Correctness**
+- Config validation: a trim must reach a backend that has a `disable_env` and must never hide a feature from its owner. `main_agent`, env keys and `disable_env` are checked. Numbers out of range are errors, not silently replaced. Unknown keys are errors.
+- JSON: a repeated key keeps one entry with the last value, and `\u` takes exactly four hex digits.
+- The project root is canonical, and `MEM_HARNESS_PROJECT` is checked. Relative commands are resolved against the project. Windows tries `PATHEXT`.
+
+**Adding tools without code**
+- Per backend: `handshake_s`, `call_s`, `env_pass`, and `hide_tools` / `only_tools`. The proxy enforces hiding itself, so it works for third-party servers.
+- `brief_sections` (with a generic `text` reader), `stores` (with `save_hint`, used by the stop nudge), and `save_tools` / `edit_tools` are config. A new backend kind needs a `KNOWN_KINDS` entry and one match arm, and reads its own settings from `BackendSpec::raw`.
+
 ## 0.2.1
 
 - **Fix:** when a backend crashes, its status now records the exit before the waiting calls are failed. Previously a caller could see the crash error and then read a status that showed no error yet. This also made one backend test fail about once in 600 runs, and once on main CI.

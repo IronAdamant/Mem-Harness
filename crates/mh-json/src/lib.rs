@@ -287,6 +287,9 @@ impl Parser<'_> {
             .get(self.i..self.i + 4)
             .ok_or_else(|| self.err("bad escape"))?;
         let s = std::str::from_utf8(s).map_err(|_| self.err("bad escape"))?;
+        if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(self.err("bad escape"));
+        }
         let n = u32::from_str_radix(s, 16).map_err(|_| self.err("bad escape"))?;
         self.i += 4;
         Ok(n)
@@ -379,6 +382,7 @@ impl Parser<'_> {
     fn object(&mut self, depth: usize) -> Result<Value, ParseError> {
         self.i += 1;
         let mut pairs: Vec<(String, Value)> = Vec::new();
+        let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         self.ws();
         if self.b.get(self.i) == Some(&b'}') {
             self.i += 1;
@@ -397,7 +401,15 @@ impl Parser<'_> {
             self.i += 1;
             self.ws();
             let v = self.value(depth + 1)?;
-            pairs.push((key, v));
+            // A repeated key keeps one entry with the last value, so `get`,
+            // `set` and `remove` all see the same thing.
+            match index.get(&key) {
+                Some(&at) => pairs[at].1 = v,
+                None => {
+                    index.insert(key.clone(), pairs.len());
+                    pairs.push((key, v));
+                }
+            }
             self.ws();
             match self.b.get(self.i) {
                 Some(b',') => self.i += 1,
@@ -414,6 +426,23 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_keys_keep_one_entry_with_the_last_value() {
+        let mut v = parse(r#"{"name":"a","x":1,"name":"b"}"#).unwrap();
+        assert_eq!(v.to_json(), r#"{"name":"b","x":1}"#);
+        v.set("name", Value::str("c"));
+        assert_eq!(v.get("name").and_then(Value::as_str), Some("c"));
+        v.remove("name");
+        assert!(v.get("name").is_none());
+    }
+
+    #[test]
+    fn unicode_escapes_take_four_hex_digits_only() {
+        assert!(parse(r#""\u+041""#).is_err());
+        assert!(parse(r#""\u-041""#).is_err());
+        assert_eq!(parse(r#""\u0041""#).unwrap(), Value::str("A"));
+    }
 
     #[test]
     fn round_trips_and_keeps_number_text() {

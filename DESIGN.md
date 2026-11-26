@@ -51,6 +51,27 @@ Agent identity: `main` for the main session; sub-agents
 `identity::subagent_name(agent_type, agent_id)` (the Libellus 1.4 scheme), used
 for every tool.
 
+## Config layers and extension points
+
+`Config::load` reads three layers. The user's own file
+(`$MEM_HARNESS_CONFIG`, else `~/.mem-harness/harness.json`, else the built-in
+one) is the only layer that may name commands. The project's
+`.mem-harness/harness.json` is an overlay limited to `PROJECT_KEYS`, because
+Claude Code may open any repository. `$MEM_HARNESS_PROFILE` is applied last.
+Every problem is an `Err`, never a panic.
+
+Adding things without code:
+- a stdio MCP server is a `backends` entry. It may set `handshake_s`,
+  `call_s`, `env_pass` (a restricted environment), and `hide_tools` /
+  `only_tools`, which the proxy enforces whatever the server honours;
+- a brief section is a `brief_sections` entry (`parse: text` for any CLI);
+- a store for `init` is a `stores` entry.
+
+A new backend kind (for example local HTTP) is a name in `KNOWN_KINDS` plus
+an arm in `mh_backend::build`. Its own settings are read from
+`BackendSpec::raw`, so `BackendSpec` does not change. HTTPS would need a TLS
+dependency, which the zero-dependency rule excludes; use a stdio bridge.
+
 ## Contracts between crates
 
 ```rust
@@ -93,13 +114,39 @@ model knows. Each event does what a hook can do (`mh_hooks::memory`):
 | SubagentStart | `subagent-start` | injects the sub-agent's name and its brief |
 | PreCompact | `pre-compact` | prints instructions for the summary: end with `## Not yet recorded`, one `- <kind>: ...` line per unsaved decision, dead end, question or result |
 | PostCompact | `post-compact` | saves those lines as Libellus notes for `main`, tagged `from-compact` (`brief.save_unrecorded_on_compact`) |
-| Stop, SubagentStop | `stop`, `subagent-stop` | when the turn edited files and called no save tool, blocks once and asks the agent to save; `stop_hook_active` lets it stop the second time (`brief.nudge_on_stop`) |
+| Stop, SubagentStop | `stop`, `subagent-stop` | when the turn edited files and called no save tool, blocks once and asks the agent to save, naming only the save tools whose store exists; `stop_hook_active` lets it stop the second time (`brief.nudge_on_stop`) |
+
+The brief's sections are `brief_sections` in the config, run concurrently
+and kept in order; `parse` picks the reader (`text` puts the command's
+stdout under `heading`; the others are the built-in Libellus, Relatum,
+Adsertio and Chisel readers). The stores the Setup section, `harness_init`
+and the hooks check are `stores`. A store path that is a symlink or a file
+is refused, as Libellus refuses it: the brief names it with the reason and
+`harness_init` does not run over it.
+
+The "Not yet recorded" list is found under that label as a heading of any
+level, a numbered (`8. Not yet recorded:`) or a bold line, any case; fenced
+code is skipped, and the list ends at a heading of the same or a higher
+level or at another numbered or bold label. Each line has control
+characters and runs of spaces collapsed before it is clipped to 200
+characters. Lines already saved as a `from-compact` note of `main` (the
+next summary repeats the last list), and repeats within one summary, are
+skipped. If Libellus refuses the batch, each line is retried alone.
 
 The stop check reads the last 8 MB of the transcript and looks at the turn
-after the last prompt. Edit tools are `Edit`, `Write`, `MultiEdit` and
-`NotebookEdit`; shell edits are not seen. A project with none of the three
-stores is never nudged. SessionEnd is not used: it cannot reach the model
-and has 1.5 seconds.
+after the last prompt. A prompt is a user entry someone typed: meta
+entries, the compact summary, entries whose `origin.kind` is not `human`
+(task notifications, peer and coordinator messages), text that is only
+`<system-reminder>` blocks, local-command and shell-escape output, and
+interrupt markers do not start a turn. Edit and save tools are
+`brief.edit_tools` and `brief.save_tools` (default edit tools `Edit`,
+`Write`, `MultiEdit`, `NotebookEdit`); shell edits are not seen. A project
+with none of the stores is never nudged. SessionEnd is not used: it cannot
+reach the model and has 1.5 seconds.
+
+Hook commands run with the brief's timeout over the whole run, output
+included; on Unix each runs in its own process group, killed on timeout
+(or when something it started still holds its output at the deadline).
 
 ## Claims about rules
 
@@ -108,3 +155,17 @@ Decided 2026-11-26: the Relatum evidence adapter lives in **Adsertio itself**
 verdict. The harness has no verdict tool of its own; `mh-adapters::relatum`
 only reads notes to list active rules in the brief. Verdicts on `relatum:`
 pointers come only from Adsertio (`adsertio_view`).
+
+## Known limits
+
+- A process that a backend server starts and leaves holding the server's
+  stdin, without reading it, can keep that connection's writer thread
+  blocked in `write` until the process exits. Nothing waits on that thread
+  (calls time out, and shutdown kills the server), so it costs one idle
+  thread, not a hang. std cannot close a pipe under a blocked writer.
+- Hook timeouts send the command's process group TERM, then KILL after
+  200 ms. A process that left the group (`setsid`) is not reached; its
+  output is no longer waited on.
+- The stop check sees only edits made through the editing tools in
+  `brief.edit_tools`; edits made with shell commands are not seen.
+

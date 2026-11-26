@@ -17,12 +17,44 @@ pub struct Trim {
     pub why: String,
 }
 
+/// Backend kinds `mh_backend::build` can start. A new kind adds its name
+/// here and a match arm there; its own settings are read from
+/// [`BackendSpec::raw`], so the spec itself does not change.
+pub const KNOWN_KINDS: &[&str] = &["stdio-mcp"];
+
+/// Variables every child keeps when `env_pass` restricts its environment.
+pub const BASE_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+];
+
 #[derive(Clone, Debug)]
 pub struct BackendSpec {
     /// Short name; also the prefix of every tool the proxy exposes for it.
     pub name: String,
-    /// `stdio-mcp` today; other kinds (HTTP, external APIs) plug in later.
+    /// One of [`KNOWN_KINDS`].
     pub kind: String,
+    /// The program for `stdio-mcp` (empty for kinds that do not start one).
     pub command: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
@@ -33,7 +65,89 @@ pub struct BackendSpec {
     pub strip_prefix: String,
     pub disable: Vec<Trim>,
     pub role: String,
+    /// Seconds to wait for the `initialize` reply (and each `tools/list` page).
+    pub handshake_s: u64,
+    /// Overall cap on one `tools/call`, in seconds.
+    pub call_s: u64,
+    /// When set, the child gets only [`BASE_ENV`], these variables and
+    /// `env`; when `None` it inherits the harness's whole environment.
+    pub env_pass: Option<Vec<String>>,
+    /// The proxy hides the backend's tools whose own name matches one of
+    /// these patterns (`*` matches any run of characters), whether or not
+    /// the backend honours `disable_env`.
+    pub hide_tools: Vec<String>,
+    /// When not empty, the proxy shows only tools matching one of these.
+    pub only_tools: Vec<String>,
+    /// The whole JSON object of this backend, for kind-specific settings.
+    pub raw: Value,
 }
+
+impl BackendSpec {
+    /// A `stdio-mcp` backend with every optional setting at its default.
+    pub fn stdio(name: &str, command: &str, args: &[&str]) -> BackendSpec {
+        BackendSpec {
+            name: name.to_string(),
+            kind: "stdio-mcp".to_string(),
+            command: command.to_string(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            env: Vec::new(),
+            disable_env: String::new(),
+            strip_prefix: String::new(),
+            disable: Vec::new(),
+            role: String::new(),
+            handshake_s: 20,
+            call_s: 3600,
+            env_pass: None,
+            hide_tools: Vec::new(),
+            only_tools: Vec::new(),
+            raw: Value::obj(vec![]),
+        }
+    }
+}
+
+/// A store a tool keeps in the project, created by `mem-harness init`.
+#[derive(Clone, Debug)]
+pub struct StoreSpec {
+    pub tool: String,
+    /// The folder at or above the project root.
+    pub dir: String,
+    /// The variable that moves it, or empty.
+    pub env: String,
+    /// The command and arguments that create it.
+    pub init: Vec<String>,
+    /// How the stop nudge names this tool's save tool, for example
+    /// `relatum_new for a rule every agent must follow`; `{agent}` is the
+    /// agent's name. Empty: the nudge does not mention it.
+    pub save_hint: String,
+}
+
+/// One section of the brief. `parse` picks the reader for the command's
+/// output: `text` (stdout lines under `heading`), or one of the built-in
+/// readers `libellus`, `relatum-rules` (no command; read natively),
+/// `adsertio-claims` and `chisel-issues`.
+#[derive(Clone, Debug)]
+pub struct SectionSpec {
+    pub name: String,
+    pub parse: String,
+    pub command: String,
+    /// `{agent}` is replaced by the agent's name.
+    pub args: Vec<String>,
+    /// Share of the budget, relative to the other sections.
+    pub weight: usize,
+    /// For `text`: the heading line put above the output.
+    pub heading: String,
+    /// Run only when this path exists in the project (for example `.chisel`).
+    pub only_if_exists: String,
+}
+
+/// The `parse` values a section may use.
+pub const SECTION_PARSERS: &[&str] = &[
+    "text",
+    "libellus",
+    "relatum-rules",
+    "adsertio-claims",
+    "chisel-issues",
+];
 
 #[derive(Clone, Debug)]
 pub struct Ownership {
@@ -61,6 +175,10 @@ pub struct BriefConfig {
     pub nudge_on_stop: bool,
     /// PostCompact: save the summary's "Not yet recorded" lines as Libellus notes.
     pub save_unrecorded_on_compact: bool,
+    /// Tools that save memory, matched on the name after the last `__`.
+    pub save_tools: Vec<String>,
+    /// Tools that edit files.
+    pub edit_tools: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -75,33 +193,112 @@ pub struct Config {
     /// Profile name -> backend -> extra trims. Profiles only hide more;
     /// they never re-enable what ownership hides.
     pub profiles: BTreeMap<String, BTreeMap<String, Vec<Trim>>>,
-    /// Where the config came from (`built-in` or a file path).
+    pub stores: Vec<StoreSpec>,
+    pub brief_sections: Vec<SectionSpec>,
+    /// Where the config came from (`built-in`, a file path, plus any
+    /// project overlay).
     pub source: String,
 }
 
+/// Top-level keys a project's `.mem-harness/harness.json` may set. It is
+/// read from whatever repository Claude Code opens, so it cannot name
+/// commands or environment: `backends`, `stores` and `brief_sections` come
+/// only from the user's own config.
+pub const PROJECT_KEYS: &[&str] = &[
+    "version",
+    "profile",
+    "profiles",
+    "brief",
+    "main_agent",
+    "routes",
+    "ownership",
+];
+
+const ALL_KEYS: &[&str] = &[
+    "version",
+    "profile",
+    "profiles",
+    "brief",
+    "main_agent",
+    "routes",
+    "ownership",
+    "backends",
+    "stores",
+    "brief_sections",
+    "$comment",
+];
+
+/// The user's own config: `~/.mem-harness/harness.json`.
+pub fn user_config_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(Path::new(&home).join(".mem-harness").join("harness.json"))
+}
+
+/// Does `pattern` match `name`? `*` matches any run of characters.
+pub fn glob(pattern: &str, name: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == name;
+    }
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if !name.starts_with(first) || name.len() < first.len() + last.len() || !name.ends_with(last) {
+        return false;
+    }
+    let mut rest = &name[first.len()..name.len() - last.len()];
+    for mid in &parts[1..parts.len() - 1] {
+        match rest.find(mid) {
+            Some(at) => rest = &rest[at + mid.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
 impl Config {
+    /// The config shipped in the binary (no environment, no files).
     pub fn builtin() -> Config {
         Config::from_json(DEFAULT_JSON, "built-in").expect("built-in config is valid")
     }
 
-    /// The config for a project: `$MEM_HARNESS_CONFIG`, else
-    /// `<project>/.mem-harness/harness.json`, else the built-in one.
+    /// The config for a project. The base is `$MEM_HARNESS_CONFIG`, else
+    /// `~/.mem-harness/harness.json`, else the built-in one; these are the
+    /// user's own and may name commands. `<project>/.mem-harness/harness.json`
+    /// is then laid over it, limited to [`PROJECT_KEYS`]. Last,
+    /// `$MEM_HARNESS_PROFILE` picks the profile. Every problem is an `Err`.
     pub fn load(project: &Path) -> Result<Config, String> {
-        let path = match std::env::var("MEM_HARNESS_CONFIG") {
-            Ok(p) if !p.trim().is_empty() => Some(PathBuf::from(p)),
-            _ => {
-                let p = project.join(".mem-harness").join("harness.json");
-                p.is_file().then_some(p)
-            }
+        let explicit = std::env::var("MEM_HARNESS_CONFIG")
+            .ok()
+            .filter(|p| !p.trim().is_empty())
+            .map(PathBuf::from);
+        let base_path = explicit
+            .clone()
+            .or_else(|| user_config_path().filter(|p| p.is_file()));
+        let (mut v, mut source) = match &base_path {
+            Some(p) => (read_json(p)?, p.display().to_string()),
+            None => (
+                mh_json::parse(DEFAULT_JSON).map_err(|e| format!("built-in: {e}"))?,
+                "built-in".to_string(),
+            ),
         };
-        match path {
-            None => Ok(Config::builtin()),
-            Some(p) => {
-                let text = std::fs::read_to_string(&p)
-                    .map_err(|e| format!("cannot read {}: {e}", p.display()))?;
-                Config::from_json(&text, &p.display().to_string())
-            }
+        let overlay = project.join(".mem-harness").join("harness.json");
+        let same = base_path.as_ref().is_some_and(|b| same_file(b, &overlay));
+        if overlay.is_file() && !same {
+            let o = read_json(&overlay)?;
+            let shown = overlay.display().to_string();
+            apply_overlay(&mut v, &o).map_err(|e| format!("{shown}: {e}"))?;
+            source = format!("{source} + {shown}");
         }
+        if let Some(p) = std::env::var("MEM_HARNESS_PROFILE")
+            .ok()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+        {
+            v.set("profile", Value::str(p));
+            source = format!("{source} (MEM_HARNESS_PROFILE)");
+        }
+        let cfg = parse_config(&v, &source).map_err(|e| format!("{source}: {e}"))?;
+        cfg.validate().map_err(|e| format!("{source}: {e}"))?;
+        Ok(cfg)
     }
 
     pub fn from_json(text: &str, source: &str) -> Result<Config, String> {
@@ -178,7 +375,201 @@ impl Config {
         format!("{backend}_{bare}")
     }
 
+    /// Does the proxy show `backend`'s tool `own` (the name the backend
+    /// lists)? A pattern may match that name or the name after
+    /// `strip_prefix` (`attach` for Adsertio's `adsertio_attach`).
+    pub fn tool_visible(&self, backend: &str, own: &str) -> bool {
+        let Some(b) = self.backend(backend) else {
+            return true;
+        };
+        let stripped = if b.strip_prefix.is_empty() {
+            own
+        } else {
+            own.strip_prefix(b.strip_prefix.as_str()).unwrap_or(own)
+        };
+        let hit = |p: &String| glob(p, own) || glob(p, stripped);
+        if b.hide_tools.iter().any(hit) {
+            return false;
+        }
+        b.only_tools.is_empty() || b.only_tools.iter().any(hit)
+    }
+
+    /// Every program the hooks and `init` run, with what needs it.
+    pub fn cli_commands(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut add = |cmd: &str, why: String| {
+            if cmd.is_empty() {
+                return;
+            }
+            match out.iter_mut().find(|(c, _)| c == cmd) {
+                Some(slot) => slot.1 = format!("{}, {why}", slot.1),
+                None => out.push((cmd.to_string(), why)),
+            }
+        };
+        for s in &self.brief_sections {
+            add(&s.command, format!("brief section {}", s.name));
+        }
+        for st in &self.stores {
+            add(
+                st.init.first().map(String::as_str).unwrap_or(""),
+                format!("init of {}", st.tool),
+            );
+        }
+        out
+    }
+
+    fn validate_backends_extra(&self) -> Result<(), String> {
+        for b in &self.backends {
+            for (k, _) in &b.env {
+                if !valid_env_key(k) {
+                    return Err(format!(
+                        "backend {:?}: env key {k:?} is not a variable name",
+                        b.name
+                    ));
+                }
+            }
+            if !b.disable_env.is_empty() {
+                if !valid_env_key(&b.disable_env) {
+                    return Err(format!(
+                        "backend {:?}: disable_env {:?} is not a variable name",
+                        b.name, b.disable_env
+                    ));
+                }
+                if BASE_ENV
+                    .iter()
+                    .any(|e| e.eq_ignore_ascii_case(&b.disable_env))
+                {
+                    return Err(format!(
+                        "backend {:?}: disable_env {:?} is a system variable",
+                        b.name, b.disable_env
+                    ));
+                }
+            }
+            for k in b.env_pass.iter().flatten() {
+                if !valid_env_key(k) {
+                    return Err(format!(
+                        "backend {:?}: env_pass {k:?} is not a variable name",
+                        b.name
+                    ));
+                }
+            }
+            for p in b.hide_tools.iter().chain(&b.only_tools) {
+                if p.trim().is_empty() {
+                    return Err(format!("backend {:?}: empty tool pattern", b.name));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Every trim must reach the backend (it needs a `disable_env`), and no
+    /// trim may hide a feature from the backend that owns it.
+    fn validate_trims(&self) -> Result<(), String> {
+        let mut aimed: Vec<(String, String, String)> = Vec::new();
+        for b in &self.backends {
+            for t in &b.disable {
+                aimed.push((
+                    b.name.clone(),
+                    t.what.clone(),
+                    format!("backend {:?}", b.name),
+                ));
+            }
+        }
+        for (name, by_backend) in &self.profiles {
+            for (b, trims) in by_backend {
+                for t in trims {
+                    aimed.push((b.clone(), t.what.clone(), format!("profile {name:?}")));
+                }
+            }
+        }
+        for o in &self.ownership {
+            for (b, list) in &o.disable {
+                for what in list {
+                    aimed.push((b.clone(), what.clone(), format!("feature {:?}", o.feature)));
+                }
+            }
+        }
+        for (b, what, ctx) in &aimed {
+            let Some(spec) = self.backend(b) else {
+                continue;
+            };
+            if spec.disable_env.is_empty() {
+                return Err(format!(
+                    "{ctx}: hides {what:?} in {b:?}, which has no disable_env, so nothing would be hidden; use hide_tools for it"
+                ));
+            }
+            if let Some(o) = self
+                .ownership
+                .iter()
+                .find(|o| &o.owner == b && o.feature.eq_ignore_ascii_case(what))
+            {
+                return Err(format!(
+                    "{ctx}: hides {what:?} in {b:?}, which owns the feature {:?}",
+                    o.feature
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_brief_parts(&self) -> Result<(), String> {
+        let mut names = Vec::new();
+        for s in &self.brief_sections {
+            if s.name.trim().is_empty() {
+                return Err("brief_sections: a section has no name".into());
+            }
+            if names.contains(&s.name) {
+                return Err(format!("brief_sections: {:?} is listed twice", s.name));
+            }
+            names.push(s.name.clone());
+            if !SECTION_PARSERS.contains(&s.parse.as_str()) {
+                return Err(format!(
+                    "brief_sections {:?}: parse {:?} is not one of {}",
+                    s.name,
+                    s.parse,
+                    SECTION_PARSERS.join(", ")
+                ));
+            }
+            if s.parse != "relatum-rules" && s.command.trim().is_empty() {
+                return Err(format!("brief_sections {:?}: command is empty", s.name));
+            }
+            if s.parse == "text" && s.heading.trim().is_empty() {
+                return Err(format!(
+                    "brief_sections {:?}: a text section needs a heading",
+                    s.name
+                ));
+            }
+            if s.weight == 0 {
+                return Err(format!(
+                    "brief_sections {:?}: weight must be at least 1",
+                    s.name
+                ));
+            }
+        }
+        for st in &self.stores {
+            if st.tool.is_empty() || st.dir.is_empty() || st.init.is_empty() {
+                return Err(format!("stores: {:?} needs tool, dir and init", st.tool));
+            }
+            if !st.env.is_empty() && !valid_env_key(&st.env) {
+                return Err(format!(
+                    "stores {:?}: env {:?} is not a variable name",
+                    st.tool, st.env
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<(), String> {
+        if !crate::identity::valid_agent(&self.main_agent) {
+            return Err(format!(
+                "main_agent {:?}: use lowercase letters, digits and '-'",
+                self.main_agent
+            ));
+        }
+        self.validate_backends_extra()?;
+        self.validate_trims()?;
+        self.validate_brief_parts()?;
         if self.profile != "full" && !self.profiles.contains_key(&self.profile) {
             let mut names: Vec<&str> = self.profiles.keys().map(String::as_str).collect();
             names.push("full");
@@ -215,13 +606,15 @@ impl Config {
                 return Err(format!("backend {:?} is listed twice", b.name));
             }
             seen.push(b.name.clone());
-            if b.kind != "stdio-mcp" {
+            if !KNOWN_KINDS.contains(&b.kind.as_str()) {
                 return Err(format!(
-                    "backend {:?}: unknown kind {:?} (stdio-mcp)",
-                    b.name, b.kind
+                    "backend {:?}: unknown kind {:?} ({})",
+                    b.name,
+                    b.kind,
+                    KNOWN_KINDS.join(", ")
                 ));
             }
-            if b.command.trim().is_empty() {
+            if b.kind == "stdio-mcp" && b.command.trim().is_empty() {
                 return Err(format!("backend {:?}: command is empty", b.name));
             }
             for t in &b.disable {
@@ -279,6 +672,64 @@ impl Config {
     }
 }
 
+fn read_json(p: &Path) -> Result<Value, String> {
+    let text =
+        std::fs::read_to_string(p).map_err(|e| format!("cannot read {}: {e}", p.display()))?;
+    mh_json::parse(&text).map_err(|e| format!("{}: {e}", p.display()))
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Lay a project file over the base: each allowed key replaces the base's,
+/// except `profiles` (merged by profile name) and `brief` (merged by key).
+fn apply_overlay(base: &mut Value, overlay: &Value) -> Result<(), String> {
+    let pairs = overlay.as_object().ok_or("must be a JSON object")?;
+    for (k, val) in pairs {
+        if k == "$comment" {
+            continue;
+        }
+        if !PROJECT_KEYS.contains(&k.as_str()) {
+            let user = user_config_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "~/.mem-harness/harness.json".into());
+            return Err(if ALL_KEYS.contains(&k.as_str()) {
+                format!(
+                    "\"{k}\" may name commands, so a project file cannot set it; put it in {user} or $MEM_HARNESS_CONFIG"
+                )
+            } else {
+                format!(
+                    "unknown key \"{k}\" (a project file may set: {})",
+                    PROJECT_KEYS.join(", ")
+                )
+            });
+        }
+        match (k.as_str(), base.get_mut(k), val) {
+            ("profiles" | "brief", Some(Value::Object(into)), Value::Object(from)) => {
+                for (pk, pv) in from {
+                    match into.iter_mut().find(|(ek, _)| ek == pk) {
+                        Some(slot) => slot.1 = pv.clone(),
+                        None => into.push((pk.clone(), pv.clone())),
+                    }
+                }
+            }
+            _ => base.set(k, val.clone()),
+        }
+    }
+    Ok(())
+}
+
+/// An environment variable name: letters, digits and `_`, not starting with a digit.
+fn valid_env_key(k: &str) -> bool {
+    !k.is_empty()
+        && !k.starts_with(|c: char| c.is_ascii_digit())
+        && k.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+}
+
 fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 32
@@ -291,6 +742,56 @@ fn str_field(v: &Value, key: &str, ctx: &str) -> Result<String, String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| format!("{ctx}: \"{key}\" must be a string"))
+}
+
+/// Default memory-saving tools for the stop check (names after the last `__`).
+pub const DEFAULT_SAVE_TOOLS: &[&str] = &[
+    "relatum_new",
+    "relatum_edit",
+    "relatum_supersede",
+    "libellus_note",
+    "libellus_resolve",
+    "libellus_plan",
+    "libellus_promote",
+    "adsertio_claim",
+    "adsertio_attach",
+];
+
+/// Default file-editing tools for the stop check.
+pub const DEFAULT_EDIT_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+/// An integer field: absent gives `default`; present must be a whole
+/// number in `min..=max`, never silently replaced.
+fn int_in(
+    v: &Value,
+    key: &str,
+    default: u64,
+    min: u64,
+    max: u64,
+    ctx: &str,
+) -> Result<u64, String> {
+    let Some(x) = v.get(key) else {
+        return Ok(default);
+    };
+    let n = match x {
+        Value::Num(t) if t.bytes().all(|c| c.is_ascii_digit()) => t.parse::<u64>().ok(),
+        _ => None,
+    };
+    match n {
+        Some(n) if (min..=max).contains(&n) => Ok(n),
+        _ => Err(format!(
+            "{ctx}.{key}: a whole number from {min} to {max} expected"
+        )),
+    }
+}
+
+fn bool_or(v: &Value, key: &str, default: bool, ctx: &str) -> Result<bool, String> {
+    match v.get(key) {
+        None => Ok(default),
+        Some(x) => x
+            .as_bool()
+            .ok_or_else(|| format!("{ctx}.{key}: true or false expected")),
+    }
 }
 
 fn opt_str(v: &Value, key: &str) -> String {
@@ -317,37 +818,36 @@ fn parse_config(v: &Value, _source: &str) -> Result<Config, String> {
         Some(1) => {}
         _ => return Err("\"version\" must be 1".into()),
     }
-    let main_agent = v
-        .get("main_agent")
-        .and_then(Value::as_str)
-        .unwrap_or("main")
-        .to_string();
-    let brief = match v.get("brief") {
-        None => BriefConfig {
-            budget_chars: 8000,
-            command_timeout_s: 10,
-            nudge_on_stop: true,
-            save_unrecorded_on_compact: true,
+    if let Some(pairs) = v.as_object() {
+        for (k, _) in pairs {
+            if !ALL_KEYS.contains(&k.as_str()) {
+                return Err(format!("unknown key \"{k}\""));
+            }
+        }
+    }
+    let main_agent = match v.get("main_agent") {
+        None => "main".to_string(),
+        Some(m) => m
+            .as_str()
+            .ok_or("\"main_agent\" must be a string")?
+            .to_string(),
+    };
+    let b = v.get("brief").cloned().unwrap_or(Value::obj(vec![]));
+    if b.as_object().is_none() {
+        return Err("\"brief\" must be an object".into());
+    }
+    let brief = BriefConfig {
+        budget_chars: int_in(&b, "budget_chars", 8000, 500, 100_000, "brief")? as usize,
+        command_timeout_s: int_in(&b, "command_timeout_s", 10, 1, 120, "brief")?,
+        nudge_on_stop: bool_or(&b, "nudge_on_stop", true, "brief")?,
+        save_unrecorded_on_compact: bool_or(&b, "save_unrecorded_on_compact", true, "brief")?,
+        save_tools: match b.get("save_tools") {
+            None => DEFAULT_SAVE_TOOLS.iter().map(|s| s.to_string()).collect(),
+            some => str_list(some, "brief.save_tools")?,
         },
-        Some(b) => BriefConfig {
-            budget_chars: b
-                .get("budget_chars")
-                .and_then(Value::as_i64)
-                .unwrap_or(8000)
-                .clamp(500, 100_000) as usize,
-            command_timeout_s: b
-                .get("command_timeout_s")
-                .and_then(Value::as_i64)
-                .unwrap_or(10)
-                .clamp(1, 120) as u64,
-            nudge_on_stop: b
-                .get("nudge_on_stop")
-                .and_then(Value::as_bool)
-                .unwrap_or(true),
-            save_unrecorded_on_compact: b
-                .get("save_unrecorded_on_compact")
-                .and_then(Value::as_bool)
-                .unwrap_or(true),
+        edit_tools: match b.get("edit_tools") {
+            None => DEFAULT_EDIT_TOOLS.iter().map(|s| s.to_string()).collect(),
+            some => str_list(some, "brief.edit_tools")?,
         },
     };
 
@@ -390,20 +890,33 @@ fn parse_config(v: &Value, _source: &str) -> Result<Config, String> {
                 });
             }
         }
+        let kind = b
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("stdio-mcp")
+            .to_string();
         backends.push(BackendSpec {
             name: str_field(b, "name", &ctx)?,
-            kind: b
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or("stdio-mcp")
-                .to_string(),
-            command: str_field(b, "command", &ctx)?,
+            command: match b.get("command") {
+                None if kind != "stdio-mcp" => String::new(),
+                _ => str_field(b, "command", &ctx)?,
+            },
+            kind,
             args: str_list(b.get("args"), &format!("{ctx}.args"))?,
             env,
             disable_env: opt_str(b, "disable_env"),
             strip_prefix: opt_str(b, "strip_prefix"),
             disable,
             role: opt_str(b, "role"),
+            handshake_s: int_in(b, "handshake_s", 20, 1, 600, &ctx)?,
+            call_s: int_in(b, "call_s", 3600, 1, 86_400, &ctx)?,
+            env_pass: match b.get("env_pass") {
+                None => None,
+                some => Some(str_list(some, &format!("{ctx}.env_pass"))?),
+            },
+            hide_tools: str_list(b.get("hide_tools"), &format!("{ctx}.hide_tools"))?,
+            only_tools: str_list(b.get("only_tools"), &format!("{ctx}.only_tools"))?,
+            raw: b.clone(),
         });
     }
 
@@ -469,14 +982,52 @@ fn parse_config(v: &Value, _source: &str) -> Result<Config, String> {
             profiles.insert(name.clone(), map);
         }
     }
-    let profile = match std::env::var("MEM_HARNESS_PROFILE") {
-        Ok(p) if !p.trim().is_empty() => p.trim().to_string(),
-        _ => v
-            .get("profile")
-            .and_then(Value::as_str)
-            .unwrap_or("full")
+    let profile = match v.get("profile") {
+        None => "full".to_string(),
+        Some(p) => p
+            .as_str()
+            .ok_or("\"profile\" must be a string")?
             .to_string(),
     };
+
+    let mut stores = Vec::new();
+    if let Some(list) = v.get("stores") {
+        for (i, st) in list
+            .as_array()
+            .ok_or("\"stores\" must be a list")?
+            .iter()
+            .enumerate()
+        {
+            let ctx = format!("stores[{i}]");
+            stores.push(StoreSpec {
+                tool: str_field(st, "tool", &ctx)?,
+                dir: str_field(st, "dir", &ctx)?,
+                env: opt_str(st, "env"),
+                init: str_list(st.get("init"), &format!("{ctx}.init"))?,
+                save_hint: opt_str(st, "save_hint"),
+            });
+        }
+    }
+    let mut brief_sections = Vec::new();
+    if let Some(list) = v.get("brief_sections") {
+        for (i, sec) in list
+            .as_array()
+            .ok_or("\"brief_sections\" must be a list")?
+            .iter()
+            .enumerate()
+        {
+            let ctx = format!("brief_sections[{i}]");
+            brief_sections.push(SectionSpec {
+                name: str_field(sec, "name", &ctx)?,
+                parse: str_field(sec, "parse", &ctx)?,
+                command: opt_str(sec, "command"),
+                args: str_list(sec.get("args"), &format!("{ctx}.args"))?,
+                weight: int_in(sec, "weight", 10, 0, 1000, &ctx)? as usize,
+                heading: opt_str(sec, "heading"),
+                only_if_exists: opt_str(sec, "only_if_exists"),
+            });
+        }
+    }
 
     Ok(Config {
         main_agent,
@@ -486,6 +1037,8 @@ fn parse_config(v: &Value, _source: &str) -> Result<Config, String> {
         routes,
         profile,
         profiles,
+        stores,
+        brief_sections,
         source: _source.to_string(),
     })
 }
@@ -544,9 +1097,8 @@ mod tests {
             "\"disable\": { \"hub\": [\"messages\"] }",
             1,
         );
-        assert!(Config::from_json(&selfdis, "t")
-            .unwrap_err()
-            .contains("cannot be disabled"));
+        let e = Config::from_json(&selfdis, "t").unwrap_err();
+        assert!(e.contains("owns the feature"), "{e}");
     }
 }
 
@@ -601,5 +1153,183 @@ mod profile_tests {
         assert!(Config::from_json(&bad, "t")
             .unwrap_err()
             .contains("not defined"));
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    fn with(edit: impl Fn(&mut Value)) -> Result<Config, String> {
+        let mut v = mh_json::parse(DEFAULT_JSON).unwrap();
+        edit(&mut v);
+        Config::from_json(&v.to_json(), "t")
+    }
+
+    fn backend_mut<'a>(v: &'a mut Value, name: &str) -> &'a mut Value {
+        let Some(Value::Array(list)) = v.get_mut("backends") else {
+            panic!()
+        };
+        list.iter_mut()
+            .find(|b| b.get("name").and_then(Value::as_str) == Some(name))
+            .unwrap()
+    }
+
+    #[test]
+    fn glob_and_tool_visibility() {
+        assert!(glob("lock_*", "lock_take"));
+        assert!(glob("*_lock", "take_lock"));
+        assert!(glob("a*b*c", "aXbYc"));
+        assert!(!glob("a*b*c", "aXcYb"));
+        assert!(!glob("ab*ba", "aba"));
+        assert!(glob("exact", "exact") && !glob("exact", "exactly"));
+        let c = with(|v| {
+            let b = backend_mut(v, "adsertio");
+            b.set("hide_tools", mh_json::parse(r#"["attach"]"#).unwrap());
+            let p = backend_mut(v, "probatio");
+            p.set("only_tools", mh_json::parse(r#"["mutate_*"]"#).unwrap());
+        })
+        .unwrap();
+        assert!(!c.tool_visible("adsertio", "adsertio_attach"));
+        assert!(!c.tool_visible("adsertio", "attach"));
+        assert!(c.tool_visible("adsertio", "adsertio_claim"));
+        assert!(c.tool_visible("probatio", "mutate_run"));
+        assert!(!c.tool_visible("probatio", "schema"));
+    }
+
+    #[test]
+    fn trims_must_reach_a_backend_and_never_hide_an_owner() {
+        let e = with(|v| {
+            let Some(Value::Array(own)) = v.get_mut("ownership") else {
+                panic!()
+            };
+            own[0].set(
+                "disable",
+                mh_json::parse(r#"{"adsertio":["claim"]}"#).unwrap(),
+            );
+        })
+        .unwrap_err();
+        assert!(e.contains("no disable_env"), "{e}");
+        let e = with(|v| {
+            let p = v.get_mut("profiles").unwrap().get_mut("lean").unwrap();
+            p.set("hub", mh_json::parse(r#"["locks"]"#).unwrap());
+        })
+        .unwrap_err();
+        assert!(e.contains("owns the feature"), "{e}");
+    }
+
+    #[test]
+    fn values_are_checked_not_replaced() {
+        for (key, val) in [
+            ("budget_chars", "99999999999999999999"),
+            ("budget_chars", "8000.0"),
+            ("budget_chars", "1e4"),
+            ("command_timeout_s", "0"),
+            ("nudge_on_stop", "\"yes\""),
+        ] {
+            let e = with(|v| {
+                v.get_mut("brief")
+                    .unwrap()
+                    .set(key, mh_json::parse(val).unwrap());
+            })
+            .unwrap_err();
+            assert!(e.contains(key), "{key}={val}: {e}");
+        }
+        assert!(with(|v| v.set("main_agent", Value::str("Main Agent"))).is_err());
+        assert!(with(|v| v.set("surprise", Value::Bool(true)))
+            .unwrap_err()
+            .contains("unknown key"));
+        for (k, bad) in [("env", r#"{"A=B":"x"}"#), ("env", r#"{"":"x"}"#)] {
+            assert!(
+                with(|v| backend_mut(v, "stele").set(k, mh_json::parse(bad).unwrap())).is_err()
+            );
+        }
+        assert!(with(|v| backend_mut(v, "stele").set("disable_env", Value::str("PATH"))).is_err());
+        assert!(with(|v| backend_mut(v, "stele").set("handshake_s", Value::int(0))).is_err());
+        let c = with(|v| backend_mut(v, "stele").set("handshake_s", Value::int(90))).unwrap();
+        assert_eq!(c.backend("stele").unwrap().handshake_s, 90);
+    }
+
+    #[test]
+    fn brief_sections_and_stores_are_in_config() {
+        let c = Config::builtin();
+        let names: Vec<&str> = c.brief_sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["libellus_brief", "relatum_ls", "adsertio_view", "issues"]
+        );
+        assert_eq!(c.stores.len(), 3);
+        let clis: Vec<String> = c.cli_commands().into_iter().map(|(c, _)| c).collect();
+        for want in ["libellus", "adsertio", "chisel", "relatum"] {
+            assert!(clis.iter().any(|c| c == want), "{want}: {clis:?}");
+        }
+        let e = with(|v| {
+            let Some(Value::Array(list)) = v.get_mut("brief_sections") else {
+                panic!()
+            };
+            list.push(mh_json::parse(r#"{"name":"x","parse":"text","command":"x"}"#).unwrap());
+        })
+        .unwrap_err();
+        assert!(e.contains("heading"), "{e}");
+    }
+
+    /// Env and files are process-wide, so every `load` case runs here, in order.
+    #[test]
+    fn load_trusts_only_the_users_config() {
+        let dir = std::env::temp_dir().join(format!("mh-core-load-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let project = dir.join("repo");
+        std::fs::create_dir_all(project.join(".mem-harness")).unwrap();
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("MEM_HARNESS_CONFIG");
+        std::env::remove_var("MEM_HARNESS_PROFILE");
+        let overlay = project.join(".mem-harness").join("harness.json");
+
+        // A repository may not name commands.
+        std::fs::write(&overlay, r#"{"version":1,"backends":[]}"#).unwrap();
+        let e = Config::load(&project).unwrap_err();
+        assert!(e.contains("cannot set it"), "{e}");
+        std::fs::write(&overlay, r#"{"brief_sections":[]}"#).unwrap();
+        assert!(Config::load(&project)
+            .unwrap_err()
+            .contains("cannot set it"));
+
+        // It may pick a profile and change brief settings, merged by key.
+        std::fs::write(
+            &overlay,
+            r#"{"profile":"full","brief":{"nudge_on_stop":false}}"#,
+        )
+        .unwrap();
+        let c = Config::load(&project).unwrap();
+        assert_eq!(c.profile, "full");
+        assert!(!c.brief.nudge_on_stop);
+        assert_eq!(c.brief.budget_chars, 8000);
+        assert_eq!(c.backends.len(), 9);
+        assert!(c.source.contains(" + "), "{}", c.source);
+
+        // The user's own file may name commands.
+        std::fs::remove_file(&overlay).unwrap();
+        std::fs::create_dir_all(home.join(".mem-harness")).unwrap();
+        let user = home.join(".mem-harness").join("harness.json");
+        let mut v = mh_json::parse(DEFAULT_JSON).unwrap();
+        backend_mut(&mut v, "stele").set("command", Value::str("stele-custom"));
+        std::fs::write(&user, v.to_json()).unwrap();
+        let c = Config::load(&project).unwrap();
+        assert_eq!(c.backend("stele").unwrap().command, "stele-custom");
+
+        // A bad profile name is an error, never a panic.
+        std::env::set_var("MEM_HARNESS_PROFILE", "Lean");
+        let e = Config::load(&project).unwrap_err();
+        assert!(e.contains("not defined"), "{e}");
+        std::env::remove_var("MEM_HARNESS_PROFILE");
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
