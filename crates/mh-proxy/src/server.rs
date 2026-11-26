@@ -1,6 +1,13 @@
 //! The MCP server loop: reads requests on the calling thread, answers slow
 //! work (tool calls, the first `tools/list`) on threads of their own, and
 //! keeps the merged catalog current as backends come and go.
+//!
+//! Locks: `state` may be held while taking `out` (a reply or notification
+//! written under `state` cannot be overtaken by a catalog change); `inflight`
+//! and `active` are leaves, never held while taking another lock. No lock is
+//! held while calling into a backend: a backend may hold its own lock while
+//! it reports an event, which takes `state`. `state_cv` (paired with
+//! `state`) is notified on every fetch result and on shutdown.
 
 use crate::catalog::{Catalog, Target};
 use crate::text;
@@ -8,22 +15,36 @@ use crate::NativeTool;
 use mh_backend::{Backend, BackendEvent, CallError, CancelToken, EventSink};
 use mh_core::Config;
 use mh_json::Value;
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, Write};
+use std::io::{self, BufRead, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Protocol versions this server speaks, newest first.
-pub const PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
-/// Answered when the client asks for a version not in the list.
-pub const DEFAULT_PROTOCOL: &str = "2025-06-18";
+/// Protocol versions this server speaks, newest first. Not 2025-03-26:
+/// it requires JSON-RPC batches, which this server does not take.
+pub const PROTOCOL_VERSIONS: [&str; 3] = ["2025-11-25", "2025-06-18", "2024-11-05"];
+/// Answered when the client asks for a version not in the list: the newest.
+pub const DEFAULT_PROTOCOL: &str = PROTOCOL_VERSIONS[0];
+/// The longest input line read; a longer one is answered -32700 and skipped.
+pub const MAX_LINE: usize = 64 << 20;
 /// The first `tools/list` waits at most this long (from startup) for backends.
 const LIST_WAIT: Duration = Duration::from_secs(20);
 /// On input EOF, how long to wait for calls still running.
 const DRAIN_WAIT: Duration = Duration::from_secs(3);
+/// After a failed fetch, the next retry waits this long, doubling per
+/// failure up to [`RETRY_MAX`].
+const RETRY_FIRST: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(60);
+/// The timer retries a failed backend this many times in a row; after that
+/// only a `tools/list` (at most every [`RETRY_MAX`]) or a call to one of
+/// its tools starts it again.
+const AUTO_RETRIES: u32 = 8;
+/// A call under a backend that is starting waits at most this long for it.
+const CALL_FETCH_WAIT: Duration = Duration::from_secs(60);
 
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
@@ -51,6 +72,18 @@ struct Slot {
     error: Option<String>,
     /// Why the process last ended, from `BackendEvent::Exited`.
     exited: Option<String>,
+    /// A fetch is running (set and cleared under the state lock).
+    fetching: bool,
+    /// Fetches that failed in a row.
+    failures: u32,
+    /// When a failed backend may be fetched again by the timer or a list.
+    retry_at: Option<Instant>,
+}
+
+impl Slot {
+    fn failed(&self) -> bool {
+        self.settled && self.error.is_some()
+    }
 }
 
 #[derive(Default)]
@@ -71,7 +104,7 @@ pub struct Shared {
     backends: OnceLock<Vec<Arc<dyn Backend>>>,
     out: Mutex<Box<dyn Write + Send>>,
     state: Mutex<State>,
-    settled_cv: Condvar,
+    state_cv: Condvar,
     inflight: Mutex<HashMap<String, CancelToken>>,
     active: Mutex<usize>,
     active_cv: Condvar,
@@ -113,7 +146,7 @@ pub fn run<R: BufRead, W: Write + Send + 'static>(
         backends: OnceLock::new(),
         out: Mutex::new(Box::new(output)),
         state: Mutex::new(State::default()),
-        settled_cv: Condvar::new(),
+        state_cv: Condvar::new(),
         inflight: Mutex::new(HashMap::new()),
         active: Mutex::new(0),
         active_cv: Condvar::new(),
@@ -136,27 +169,35 @@ pub fn run<R: BufRead, W: Write + Send + 'static>(
         shared.rebuild(&mut st);
     }
     for i in 0..n {
-        let s = shared.clone();
-        let name = format!("mh-start-{}", shared.backends()[i].name());
-        let spawned = thread::Builder::new()
-            .name(name)
-            .spawn(move || s.fetch(i, true));
-        if let Err(e) = spawned {
-            let mut st = lock(&shared.state);
-            st.slots[i].settled = true;
-            st.slots[i].error = Some(format!("cannot start a thread: {e}"));
-            shared.settled_cv.notify_all();
-        }
+        let mut st = lock(&shared.state);
+        shared.spawn_fetch(&mut st, i, true, "start");
     }
+    let retry = if n > 0 {
+        let s = shared.clone();
+        thread::Builder::new()
+            .name("mh-retry".into())
+            .spawn(move || s.retry_loop())
+            .map_err(|e| log(&format!("cannot start the retry timer: {e}")))
+            .ok()
+    } else {
+        None
+    };
 
     let mut result = Ok(());
     let mut buf = Vec::new();
     loop {
-        buf.clear();
-        match input.read_until(b'\n', &mut buf) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+        match read_line_capped(&mut input, &mut buf, MAX_LINE) {
+            Ok(Line::Eof) => break,
+            Ok(Line::Read) => {}
+            Ok(Line::TooLong) => {
+                shared.send_error(
+                    Value::Null,
+                    PARSE_ERROR,
+                    format!("parse error: message longer than {MAX_LINE} bytes; skipped"),
+                    None,
+                );
+                continue;
+            }
             Err(e) => {
                 result = Err(format!("reading the client's input: {e}"));
                 break;
@@ -174,7 +215,15 @@ pub fn run<R: BufRead, W: Write + Send + 'static>(
         }
     }
 
-    shared.closing.store(true, Ordering::SeqCst);
+    {
+        // Under the state lock, so the retry timer cannot miss the wakeup.
+        let _st = lock(&shared.state);
+        shared.closing.store(true, Ordering::SeqCst);
+    }
+    shared.state_cv.notify_all();
+    if let Some(h) = retry {
+        let _ = h.join();
+    }
     let stoppers: Vec<_> = shared
         .backends()
         .iter()
@@ -199,6 +248,70 @@ pub fn run<R: BufRead, W: Write + Send + 'static>(
             .0;
     }
     result
+}
+
+enum Line {
+    Eof,
+    /// `buf` holds the line (with its newline, if any).
+    Read,
+    /// The line was longer than the cap; it was consumed, not kept.
+    TooLong,
+}
+
+/// Read one line into `buf`, keeping at most `cap` bytes of it: a longer
+/// line is read to its end and dropped, without buffering it.
+fn read_line_capped<R: BufRead>(r: &mut R, buf: &mut Vec<u8>, cap: usize) -> io::Result<Line> {
+    buf.clear();
+    let mut over = false;
+    loop {
+        let (used, done) = {
+            let avail = match r.fill_buf() {
+                Ok(b) => b,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if avail.is_empty() {
+                return Ok(if over {
+                    Line::TooLong
+                } else if buf.is_empty() {
+                    Line::Eof
+                } else {
+                    Line::Read
+                });
+            }
+            let (chunk, done) = match avail.iter().position(|b| *b == b'\n') {
+                Some(p) => (&avail[..=p], true),
+                None => (avail, false),
+            };
+            if !over {
+                if buf.len() + chunk.len() > cap {
+                    over = true;
+                    buf.clear();
+                    buf.shrink_to(0);
+                } else {
+                    buf.extend_from_slice(chunk);
+                }
+            }
+            (chunk.len(), done)
+        };
+        r.consume(used);
+        if done {
+            return Ok(if over { Line::TooLong } else { Line::Read });
+        }
+    }
+}
+
+fn panic_text(p: &(dyn Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".into())
+}
+
+/// How long to wait before retrying after `failures` failed fetches in a row.
+fn backoff(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(16);
+    (RETRY_FIRST * (1u32 << shift)).min(RETRY_MAX)
 }
 
 impl Shared {
@@ -257,13 +370,13 @@ impl Shared {
     // ---- threads ----
 
     /// Run `f` on a new thread counted as in flight. On failure to spawn,
-    /// answers `id` (if any) with an internal error.
+    /// answers `id` (if any) with an internal error and returns false.
     fn spawn_tracked(
         self: &Arc<Self>,
         what: &str,
         id: Option<Value>,
         f: impl FnOnce() + Send + 'static,
-    ) {
+    ) -> bool {
         *lock(&self.active) += 1;
         let guard = ActiveGuard(self.clone());
         let spawned = thread::Builder::new()
@@ -282,7 +395,9 @@ impl Shared {
                     None,
                 );
             }
+            return false;
         }
+        true
     }
 
     // ---- catalog ----
@@ -316,30 +431,76 @@ impl Shared {
         }
     }
 
-    /// Fetch one backend's tools (starting it first at startup) and fold
+    /// Mark a fetch of backend `i` as running; returns its generation.
+    /// Called with the state lock held, so two callers never both start one.
+    fn begin_fetch(st: &mut State, i: usize) -> u64 {
+        let slot = &mut st.slots[i];
+        slot.generation += 1;
+        slot.fetching = true;
+        slot.generation
+    }
+
+    /// Begin a fetch of backend `i` and run it on a thread of its own.
+    fn spawn_fetch(self: &Arc<Self>, st: &mut State, i: usize, start_first: bool, what: &str) {
+        let generation = Self::begin_fetch(st, i);
+        let s = self.clone();
+        let name = format!("mh-{what}-{}", self.backends()[i].name());
+        let spawned = thread::Builder::new()
+            .name(name)
+            .spawn(move || s.run_fetch(i, generation, start_first));
+        if let Err(e) = spawned {
+            let slot = &mut st.slots[i];
+            slot.settled = true;
+            slot.fetching = false;
+            slot.error = Some(format!("cannot start a thread: {e}"));
+            slot.failures += 1;
+            slot.retry_at = Some(Instant::now() + backoff(slot.failures));
+            self.state_cv.notify_all();
+        }
+    }
+
+    /// Fetch one backend's tools (starting it first when asked) and fold
     /// the result into the catalog. Never called with the state lock held.
     fn fetch(self: &Arc<Self>, i: usize, start_first: bool) {
-        let generation = {
-            let mut st = lock(&self.state);
-            st.slots[i].generation += 1;
-            st.slots[i].generation
-        };
+        let generation = Self::begin_fetch(&mut lock(&self.state), i);
+        self.run_fetch(i, generation, start_first);
+    }
+
+    fn run_fetch(self: &Arc<Self>, i: usize, generation: u64, start_first: bool) {
         let b = self.backends()[i].clone();
-        let res = if start_first {
-            b.start().and_then(|_| b.list_tools())
+        let res = if self.closing.load(Ordering::SeqCst) {
+            Err(CallError::Unavailable(
+                "the harness is shutting down".into(),
+            ))
         } else {
-            b.list_tools()
+            catch_unwind(AssertUnwindSafe(|| {
+                if start_first {
+                    b.start().and_then(|_| b.list_tools())
+                } else {
+                    b.list_tools()
+                }
+            }))
+            .unwrap_or_else(|p| {
+                Err(CallError::Unavailable(format!(
+                    "it panicked while starting or listing tools: {}",
+                    panic_text(p.as_ref())
+                )))
+            })
         };
         let mut st = lock(&self.state);
         if st.slots[i].generation != generation {
+            // A newer fetch is running; it reports and clears `fetching`.
             return;
         }
         let slot = &mut st.slots[i];
         slot.settled = true;
+        slot.fetching = false;
         match res {
             Ok(tools) => {
                 slot.tools = tools;
                 slot.error = None;
+                slot.failures = 0;
+                slot.retry_at = None;
             }
             Err(e) => {
                 let msg = match e {
@@ -348,10 +509,118 @@ impl Shared {
                 };
                 log(&format!("backend {:?}: {msg}", b.name()));
                 slot.error = Some(msg);
+                slot.failures += 1;
+                slot.retry_at = Some(Instant::now() + backoff(slot.failures));
             }
         }
         self.rebuild_and_notify(&mut st);
-        self.settled_cv.notify_all();
+        self.state_cv.notify_all();
+    }
+
+    /// Retries failed backends with backoff, [`AUTO_RETRIES`] times in a
+    /// row each, so a backend whose first start failed (a slow first launch,
+    /// say) comes back and the client gets `list_changed`. Ends on shutdown.
+    fn retry_loop(self: &Arc<Self>) {
+        let mut st = lock(&self.state);
+        loop {
+            if self.closing.load(Ordering::SeqCst) {
+                return;
+            }
+            let now = Instant::now();
+            let mut next: Option<Instant> = None;
+            for i in 0..st.slots.len() {
+                let slot = &st.slots[i];
+                if !slot.failed() || slot.fetching || slot.failures > AUTO_RETRIES {
+                    continue;
+                }
+                let Some(at) = slot.retry_at else { continue };
+                if at <= now {
+                    self.spawn_fetch(&mut st, i, true, "retry");
+                } else {
+                    next = Some(next.map_or(at, |n| n.min(at)));
+                }
+            }
+            st = match next {
+                Some(at) => {
+                    self.state_cv
+                        .wait_timeout(st, at.saturating_duration_since(Instant::now()))
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0
+                }
+                None => self.state_cv.wait(st).unwrap_or_else(|e| e.into_inner()),
+            };
+        }
+    }
+
+    /// On `tools/list`: start a fetch of every failed backend whose backoff
+    /// has passed; a success sends `list_changed`.
+    fn retry_failed(self: &Arc<Self>, st: &mut State) {
+        if self.closing.load(Ordering::SeqCst) {
+            return;
+        }
+        let now = Instant::now();
+        for i in 0..st.slots.len() {
+            let slot = &st.slots[i];
+            if slot.failed() && !slot.fetching && slot.retry_at.is_none_or(|at| at <= now) {
+                self.spawn_fetch(st, i, true, "retry");
+            }
+        }
+    }
+
+    /// The backend a name falls under by its `<backend>_` prefix (the
+    /// longest match).
+    fn owner_of(&self, name: &str) -> Option<usize> {
+        self.backends()
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| {
+                name.strip_prefix(b.name())
+                    .is_some_and(|r| r.starts_with('_'))
+            })
+            .max_by_key(|(_, b)| b.name().len())
+            .map(|(i, _)| i)
+    }
+
+    /// For a name not in the catalog: the backend it falls under, when that
+    /// backend is starting or failed, so a fetch may still bring the tool.
+    fn recoverable(&self, name: &str) -> Option<usize> {
+        let i = self.owner_of(name)?;
+        let st = lock(&self.state);
+        let slot = &st.slots[i];
+        (!slot.settled || slot.fetching || slot.error.is_some()).then_some(i)
+    }
+
+    /// For a call to a name under backend `i` that is not in the catalog:
+    /// wait for a fetch already running, else fetch (starting the backend)
+    /// once; then look the name up again.
+    fn fetch_for_call(self: &Arc<Self>, i: usize, name: &str) -> Option<Target> {
+        let deadline = Instant::now() + CALL_FETCH_WAIT;
+        let mut st = lock(&self.state);
+        loop {
+            if let Some(t) = st.catalog.targets.get(name) {
+                return Some(t.clone());
+            }
+            let slot = &st.slots[i];
+            let busy = slot.fetching || !slot.settled;
+            let now = Instant::now();
+            if self.closing.load(Ordering::SeqCst) || now >= deadline {
+                return None;
+            }
+            if !busy {
+                break;
+            }
+            st = self
+                .state_cv
+                .wait_timeout(st, deadline - now)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        // Up, and the tool is not there: nothing to fetch.
+        st.slots[i].error.as_ref()?;
+        let generation = Self::begin_fetch(&mut st, i);
+        drop(st);
+        self.run_fetch(i, generation, true);
+        lock(&self.state).catalog.targets.get(name).cloned()
     }
 
     fn on_event(self: &Arc<Self>, name: &str, ev: BackendEvent) {
@@ -425,8 +694,16 @@ impl Shared {
                     None,
                 )
             }
-            // A response to a request we never sent: ignore.
-            None => return,
+            // A response (to a request we never sent): ignore.
+            None if pairs.get("result").is_some() || pairs.get("error").is_some() => return,
+            None => {
+                return self.send_error(
+                    id.unwrap_or(Value::Null),
+                    INVALID_REQUEST,
+                    "invalid request: no method, and not a response (no result or error)".into(),
+                    None,
+                )
+            }
         };
         let params = pairs.get("params").cloned().unwrap_or(Value::Null);
         let Some(id) = id else {
@@ -435,7 +712,7 @@ impl Shared {
         match method.as_str() {
             "initialize" => self.on_initialize(id, &params),
             "ping" => self.send_result(id, Value::obj(vec![])),
-            "tools/list" => self.on_list(id),
+            "tools/list" => self.on_list(id, &params),
             "tools/call" => self.on_call(id, &params),
             other => self.send_error(
                 id,
@@ -492,15 +769,27 @@ impl Shared {
         st.slots.iter().all(|s| s.settled)
     }
 
-    fn reply_list(&self, id: Value) {
+    fn reply_list(self: &Arc<Self>, id: Value) {
         let mut st = lock(&self.state);
         st.listed = true;
         let result = Value::obj(vec![("tools", Value::Array(st.catalog.tools.clone()))]);
         // Written under the state lock so no list_changed can overtake it.
         self.send_result(id, result);
+        self.retry_failed(&mut st);
     }
 
-    fn on_list(self: &Arc<Self>, id: Value) {
+    fn on_list(self: &Arc<Self>, id: Value, params: &Value) {
+        if let Some(c) = params.get("cursor").filter(|c| !c.is_null()) {
+            return self.send_error(
+                id,
+                INVALID_PARAMS,
+                format!(
+                    "tools/list: unknown cursor {}; this server lists every tool on one page and never issues a cursor",
+                    c.to_json()
+                ),
+                None,
+            );
+        }
         let deadline = self.started + LIST_WAIT;
         if Self::all_settled(&lock(&self.state)) || Instant::now() >= deadline {
             return self.reply_list(id);
@@ -514,7 +803,7 @@ impl Shared {
                     break;
                 }
                 st = s
-                    .settled_cv
+                    .state_cv
                     .wait_timeout(st, deadline - now)
                     .unwrap_or_else(|e| e.into_inner())
                     .0;
@@ -534,9 +823,17 @@ impl Shared {
             );
         };
         let target = lock(&self.state).catalog.targets.get(name).cloned();
-        let Some(target) = target else {
-            let msg = self.unknown_tool(name);
-            return self.send_error(id, INVALID_PARAMS, msg, None);
+        // Not listed: when it falls under a backend that is starting or
+        // failed, the call thread fetches that backend's tools first.
+        let pending = match target {
+            Some(t) => Ok(t),
+            None => match self.recoverable(name) {
+                Some(i) => Err(i),
+                None => {
+                    let msg = self.unknown_tool(name);
+                    return self.send_error(id, INVALID_PARAMS, msg, None);
+                }
+            },
         };
         let arguments = match params.get("arguments") {
             None | Some(Value::Null) => Value::obj(vec![]),
@@ -548,13 +845,35 @@ impl Shared {
         lock(&self.inflight).insert(key.clone(), token.clone());
         let s = self.clone();
         let name = name.to_string();
-        self.spawn_tracked(&format!("call-{name}"), Some(id.clone()), move || {
-            let reply = s.call(&name, target, arguments, meta, &token);
-            lock(&s.inflight).remove(&key);
+        let k = key.clone();
+        let spawned = self.spawn_tracked(&format!("call-{name}"), Some(id.clone()), move || {
+            let reply = catch_unwind(AssertUnwindSafe(|| {
+                let target = match pending {
+                    Ok(t) => Some(t),
+                    Err(i) => s.fetch_for_call(i, &name),
+                };
+                match target {
+                    Some(t) => s.call(&name, t, arguments, meta, &token),
+                    None => Reply::Error(INVALID_PARAMS, s.unknown_tool(&name), None),
+                }
+            }))
+            .unwrap_or_else(|p| {
+                Reply::Result(text::text_result(
+                    format!(
+                        "{name} failed: the harness panicked: {}",
+                        panic_text(p.as_ref())
+                    ),
+                    true,
+                ))
+            });
+            lock(&s.inflight).remove(&k);
             if !token.is_cancelled() {
                 s.send(id, reply);
             }
         });
+        if !spawned {
+            lock(&self.inflight).remove(&key);
+        }
     }
 
     fn call(
@@ -580,7 +899,19 @@ impl Shared {
             }
             Target::Backend(i, tool) => {
                 let b = self.backends()[i].clone();
-                match b.call_tool(&tool, arguments, meta, token) {
+                let res = catch_unwind(AssertUnwindSafe(|| {
+                    b.call_tool(&tool, arguments, meta, token)
+                }));
+                let res = match res {
+                    Ok(r) => r,
+                    Err(p) => {
+                        return Reply::Result(text::text_result(
+                            text::panicked(name, b.name(), &panic_text(p.as_ref())),
+                            true,
+                        ))
+                    }
+                };
+                match res {
                     Ok(v) => Reply::Result(v),
                     Err(CallError::Rpc {
                         code,
@@ -648,9 +979,14 @@ impl Shared {
     }
 
     fn status_json(&self) -> Value {
-        let (slots, counts) = {
+        let (slots, counts, hidden, ignored) = {
             let st = lock(&self.state);
-            (st.slots.clone(), st.catalog.counts.clone())
+            (
+                st.slots.clone(),
+                st.catalog.counts.clone(),
+                st.catalog.hidden.clone(),
+                st.catalog.ignored_disable.clone(),
+            )
         };
         let mut backends = Vec::new();
         for (i, b) in self.backends().iter().enumerate() {
@@ -698,6 +1034,22 @@ impl Shared {
                     Value::int(counts.get(i).copied().unwrap_or(0) as i64),
                 ),
                 ("disabled", Value::Array(disabled)),
+                (
+                    "hidden",
+                    Value::int(hidden.get(i).copied().unwrap_or(0) as i64),
+                ),
+                (
+                    "ignored_disable",
+                    Value::Array(
+                        ignored
+                            .get(i)
+                            .into_iter()
+                            .flatten()
+                            .cloned()
+                            .map(Value::str)
+                            .collect(),
+                    ),
+                ),
             ]));
         }
         let ownership = self
@@ -718,5 +1070,35 @@ impl Shared {
             ("ownership", Value::Array(ownership)),
             ("native_tools", Value::int(self.native_defs.len() as i64)),
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::BufReader;
+
+    #[test]
+    fn capped_lines() {
+        // A 3-byte buffer, so lines span several fill_buf calls.
+        let text: &[u8] = b"ab\nabcdefgh\nabcd\n\nxyz";
+        let mut r = BufReader::with_capacity(3, text);
+        let mut buf = Vec::new();
+        let mut got = Vec::new();
+        loop {
+            match read_line_capped(&mut r, &mut buf, 5).unwrap() {
+                Line::Eof => break,
+                Line::Read => got.push(String::from_utf8(buf.clone()).unwrap()),
+                Line::TooLong => got.push("<too long>".into()),
+            }
+        }
+        assert_eq!(got, ["ab\n", "<too long>", "abcd\n", "\n", "xyz"]);
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_the_cap() {
+        assert_eq!(backoff(1), RETRY_FIRST);
+        assert_eq!(backoff(2), RETRY_FIRST * 2);
+        assert_eq!(backoff(100), RETRY_MAX);
     }
 }

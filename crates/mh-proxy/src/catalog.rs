@@ -23,6 +23,12 @@ pub struct Catalog {
     pub targets: HashMap<String, Target>,
     /// Exposed tool count per backend.
     pub counts: Vec<usize>,
+    /// Per backend, how many of its tools `hide_tools`/`only_tools` hid.
+    pub hidden: Vec<usize>,
+    /// Per backend, the tools it lists (and the proxy exposes) although
+    /// their exact name is in its computed disable list: the backend
+    /// ignored its `disable_env`. Groups cannot be checked this way.
+    pub ignored_disable: Vec<Vec<String>>,
     /// `tools` as JSON, to tell whether a rebuild changed anything.
     pub json: String,
 }
@@ -38,6 +44,8 @@ impl Catalog {
     ) -> (Catalog, Vec<String>) {
         let mut cat = Catalog {
             counts: vec![0; backends.len()],
+            hidden: vec![0; backends.len()],
+            ignored_disable: vec![Vec::new(); backends.len()],
             ..Catalog::default()
         };
         let mut notes = Vec::new();
@@ -63,6 +71,7 @@ impl Catalog {
             cat.tools.push(def.clone());
         }
         for (bi, (bname, tools)) in backends.iter().enumerate() {
+            let disabled = cfg.disabled_in(bname);
             for tool in tools.iter() {
                 let Some(orig) = tool.get("name").and_then(Value::as_str) else {
                     notes.push(format!(
@@ -70,12 +79,22 @@ impl Catalog {
                     ));
                     continue;
                 };
+                if !cfg.tool_visible(bname, orig) {
+                    cat.hidden[bi] += 1;
+                    continue;
+                }
                 let exposed = cfg.exposed_name(bname, orig);
                 if let Some(first) = owner_of.get(&exposed) {
                     notes.push(format!(
                         "tool {exposed:?}: {bname}'s {orig:?} collides with {first}; kept the first"
                     ));
                     continue;
+                }
+                let bare = &exposed[bname.len() + 1..];
+                if disabled.iter().any(|d| d == orig || d == bare)
+                    && !cat.ignored_disable[bi].iter().any(|t| t == orig)
+                {
+                    cat.ignored_disable[bi].push(orig.to_string());
                 }
                 let mut def = tool.clone();
                 def.set("name", Value::str(exposed.clone()));
