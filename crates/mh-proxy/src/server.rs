@@ -7,11 +7,12 @@
 //! and `active` are leaves, never held while taking another lock. No lock is
 //! held while calling into a backend: a backend may hold its own lock while
 //! it reports an event, which takes `state`. `state_cv` (paired with
-//! `state`) is notified on every fetch result and on shutdown.
+//! `state`) is notified on every fetch result, on every cancel, and on
+//! shutdown, each time with `state` held so a waiter cannot miss it.
 
 use crate::catalog::{Catalog, Target};
 use crate::text;
-use crate::NativeTool;
+use crate::{NativeTool, Options};
 use mh_backend::{Backend, BackendEvent, CallError, CancelToken, EventSink};
 use mh_core::Config;
 use mh_json::Value;
@@ -19,7 +20,7 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -33,7 +34,7 @@ pub const DEFAULT_PROTOCOL: &str = PROTOCOL_VERSIONS[0];
 pub const MAX_LINE: usize = 64 << 20;
 /// The first `tools/list` waits at most this long (from startup) for backends.
 const LIST_WAIT: Duration = Duration::from_secs(20);
-/// On input EOF, how long to wait for calls still running.
+/// On input EOF, how long to wait in all for calls and fetches still running.
 const DRAIN_WAIT: Duration = Duration::from_secs(3);
 /// After a failed fetch, the next retry waits this long, doubling per
 /// failure up to [`RETRY_MAX`].
@@ -51,6 +52,18 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
+
+/// MCP (RFC 5424) log levels, least severe first.
+const LOG_LEVELS: [&str; 8] = [
+    "debug",
+    "info",
+    "notice",
+    "warning",
+    "error",
+    "critical",
+    "alert",
+    "emergency",
+];
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -78,6 +91,8 @@ struct Slot {
     failures: u32,
     /// When a failed backend may be fetched again by the timer or a list.
     retry_at: Option<Instant>,
+    /// A `ToolsChanged` arrived while a fetch ran: list again after it.
+    dirty: bool,
 }
 
 impl Slot {
@@ -110,6 +125,10 @@ pub struct Shared {
     active_cv: Condvar,
     started: Instant,
     closing: AtomicBool,
+    /// Index into [`LOG_LEVELS`]: relayed `notifications/message` below it
+    /// are dropped (`logging/setLevel`).
+    log_min: AtomicUsize,
+    retry_timer: bool,
 }
 
 /// Decrements the active-thread count when a tracked thread ends.
@@ -129,12 +148,20 @@ enum Reply {
     None,
 }
 
+/// What a call to a name not yet in the catalog ends with.
+enum Found {
+    Target(Target),
+    Unknown,
+    Cancelled,
+}
+
 pub fn run<R: BufRead, W: Write + Send + 'static>(
     cfg: Config,
     natives: Vec<NativeTool>,
     make_backends: impl FnOnce(EventSink) -> Vec<Arc<dyn Backend>>,
     mut input: R,
     output: W,
+    opts: Options,
 ) -> Result<(), String> {
     let mut native_defs = vec![text::status_def()];
     native_defs.extend(natives.iter().map(|n| n.def.clone()));
@@ -152,6 +179,8 @@ pub fn run<R: BufRead, W: Write + Send + 'static>(
         active_cv: Condvar::new(),
         started: Instant::now(),
         closing: AtomicBool::new(false),
+        log_min: AtomicUsize::new(0),
+        retry_timer: opts.retry_timer,
     });
 
     let weak = Arc::downgrade(&shared);
@@ -172,7 +201,7 @@ pub fn run<R: BufRead, W: Write + Send + 'static>(
         let mut st = lock(&shared.state);
         shared.spawn_fetch(&mut st, i, true, "start");
     }
-    let retry = if n > 0 {
+    let retry = if n > 0 && shared.retry_timer {
         let s = shared.clone();
         thread::Builder::new()
             .name("mh-retry".into())
@@ -215,12 +244,14 @@ pub fn run<R: BufRead, W: Write + Send + 'static>(
         }
     }
 
+    // One deadline for both drains below.
+    let deadline = Instant::now() + DRAIN_WAIT;
     {
-        // Under the state lock, so the retry timer cannot miss the wakeup.
+        // Under the state lock, so no waiter can miss the wakeup.
         let _st = lock(&shared.state);
         shared.closing.store(true, Ordering::SeqCst);
+        shared.state_cv.notify_all();
     }
-    shared.state_cv.notify_all();
     if let Some(h) = retry {
         let _ = h.join();
     }
@@ -233,7 +264,6 @@ pub fn run<R: BufRead, W: Write + Send + 'static>(
     for h in stoppers {
         let _ = h.join();
     }
-    let deadline = Instant::now() + DRAIN_WAIT;
     let mut active = lock(&shared.active);
     while *active > 0 {
         let now = Instant::now();
@@ -250,9 +280,8 @@ pub fn run<R: BufRead, W: Write + Send + 'static>(
     drop(active);
     // A fetch that passed its `closing` check just before shutdown began can
     // still start its backend after the stop above. Wait for running
-    // fetches (bounded), then stop every backend again; stopping one that
-    // is not running does nothing.
-    let deadline = Instant::now() + DRAIN_WAIT;
+    // fetches (until the same deadline), then stop every backend again;
+    // stopping one that is not running does nothing.
     {
         let mut st = lock(&shared.state);
         while st.slots.iter().any(|s| s.fetching) {
@@ -282,11 +311,31 @@ enum Line {
     TooLong,
 }
 
-/// Read one line into `buf`, keeping at most `cap` bytes of it: a longer
-/// line is read to its end and dropped, without buffering it.
+/// The length of a line without its `\n` or `\r\n` terminator.
+fn content_len(line: &[u8]) -> usize {
+    match line {
+        [.., b'\r', b'\n'] => line.len() - 2,
+        [.., b'\n'] => line.len() - 1,
+        _ => line.len(),
+    }
+}
+
+/// Read one line into `buf`, keeping it when its content (not counting the
+/// `\n` or `\r\n` that ends it) is at most `cap` bytes: a longer line is
+/// read to its end and dropped, without buffering it.
 fn read_line_capped<R: BufRead>(r: &mut R, buf: &mut Vec<u8>, cap: usize) -> io::Result<Line> {
     buf.clear();
+    // Room for the content plus a two-byte terminator.
+    let keep = cap.saturating_add(2);
     let mut over = false;
+    let finish = |over: bool, buf: &mut Vec<u8>| {
+        if over || content_len(buf) > cap {
+            buf.clear();
+            Line::TooLong
+        } else {
+            Line::Read
+        }
+    };
     loop {
         let (used, done) = {
             let avail = match r.fill_buf() {
@@ -295,20 +344,17 @@ fn read_line_capped<R: BufRead>(r: &mut R, buf: &mut Vec<u8>, cap: usize) -> io:
                 Err(e) => return Err(e),
             };
             if avail.is_empty() {
-                return Ok(if over {
-                    Line::TooLong
-                } else if buf.is_empty() {
-                    Line::Eof
-                } else {
-                    Line::Read
-                });
+                if !over && buf.is_empty() {
+                    return Ok(Line::Eof);
+                }
+                return Ok(finish(over, buf));
             }
             let (chunk, done) = match avail.iter().position(|b| *b == b'\n') {
                 Some(p) => (&avail[..=p], true),
                 None => (avail, false),
             };
             if !over {
-                if buf.len() + chunk.len() > cap {
+                if buf.len() + chunk.len() > keep {
                     over = true;
                     buf.clear();
                     buf.shrink_to(0);
@@ -320,7 +366,7 @@ fn read_line_capped<R: BufRead>(r: &mut R, buf: &mut Vec<u8>, cap: usize) -> io:
         };
         r.consume(used);
         if done {
-            return Ok(if over { Line::TooLong } else { Line::Read });
+            return Ok(finish(over, buf));
         }
     }
 }
@@ -485,11 +531,6 @@ impl Shared {
 
     /// Fetch one backend's tools (starting it first when asked) and fold
     /// the result into the catalog. Never called with the state lock held.
-    fn fetch(self: &Arc<Self>, i: usize, start_first: bool) {
-        let generation = Self::begin_fetch(&mut lock(&self.state), i);
-        self.run_fetch(i, generation, start_first);
-    }
-
     fn run_fetch(self: &Arc<Self>, i: usize, generation: u64, start_first: bool) {
         let b = self.backends()[i].clone();
         let res = if self.closing.load(Ordering::SeqCst) {
@@ -519,12 +560,17 @@ impl Shared {
         let slot = &mut st.slots[i];
         slot.settled = true;
         slot.fetching = false;
+        let dirty = std::mem::take(&mut slot.dirty);
         match res {
             Ok(tools) => {
                 slot.tools = tools;
                 slot.error = None;
                 slot.failures = 0;
                 slot.retry_at = None;
+                // Its tools changed while this fetch ran: list them again.
+                if dirty && !self.closing.load(Ordering::SeqCst) {
+                    self.spawn_fetch(&mut st, i, false, "refetch");
+                }
             }
             Err(e) => {
                 let msg = match e {
@@ -558,11 +604,18 @@ impl Shared {
                     continue;
                 }
                 let Some(at) = slot.retry_at else { continue };
-                if at <= now {
+                let at = if at <= now {
                     self.spawn_fetch(&mut st, i, true, "retry");
+                    // A thread that could not be spawned set a new retry time.
+                    let slot = &st.slots[i];
+                    match slot.retry_at {
+                        Some(at) if !slot.fetching => at,
+                        _ => continue,
+                    }
                 } else {
-                    next = Some(next.map_or(at, |n| n.min(at)));
-                }
+                    at
+                };
+                next = Some(next.map_or(at, |n| n.min(at)));
             }
             st = match next {
                 Some(at) => {
@@ -606,66 +659,89 @@ impl Shared {
     }
 
     /// For a name not in the catalog: the backend it falls under, when that
-    /// backend is starting or failed, so a fetch may still bring the tool.
-    fn recoverable(&self, name: &str) -> Option<usize> {
+    /// backend is starting or failed, so a fetch may still bring the tool;
+    /// with the slot's generation now and whether a fetch is running now.
+    fn recoverable(&self, name: &str) -> Option<(usize, u64, bool)> {
         let i = self.owner_of(name)?;
         let st = lock(&self.state);
         let slot = &st.slots[i];
-        (!slot.settled || slot.fetching || slot.error.is_some()).then_some(i)
+        let busy = !slot.settled || slot.fetching;
+        (busy || slot.error.is_some()).then_some((i, slot.generation, busy))
     }
 
-    /// For a call to a name under backend `i` that is not in the catalog:
-    /// wait for a fetch already running, else fetch (starting the backend)
-    /// once; then look the name up again.
-    fn fetch_for_call(self: &Arc<Self>, i: usize, name: &str) -> Option<Target> {
+    /// For a call to a name under backend `i` that is not in the catalog
+    /// (when it arrived, the slot had `generation`, and `busy` said whether
+    /// a fetch was running): wait for running fetches; when none has run
+    /// since the call arrived and the backend is failed, fetch (starting
+    /// it) once; then look the name up again. A call that waited on a
+    /// fetch takes that fetch's result. All of it within one deadline; it
+    /// stops when the call is cancelled.
+    fn fetch_for_call(
+        self: &Arc<Self>,
+        i: usize,
+        generation: u64,
+        busy: bool,
+        name: &str,
+        token: &CancelToken,
+    ) -> Found {
         let deadline = Instant::now() + CALL_FETCH_WAIT;
+        let mut fetched = busy;
         let mut st = lock(&self.state);
         loop {
             if let Some(t) = st.catalog.targets.get(name) {
-                return Some(t.clone());
+                return Found::Target(t.clone());
             }
-            let slot = &st.slots[i];
-            let busy = slot.fetching || !slot.settled;
+            if token.is_cancelled() {
+                return Found::Cancelled;
+            }
             let now = Instant::now();
             if self.closing.load(Ordering::SeqCst) || now >= deadline {
-                return None;
+                return Found::Unknown;
             }
-            if !busy {
-                break;
+            let slot = &st.slots[i];
+            if slot.fetching || !slot.settled {
+                st = self
+                    .state_cv
+                    .wait_timeout(st, deadline - now)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+                continue;
             }
-            st = self
-                .state_cv
-                .wait_timeout(st, deadline - now)
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
+            // Up and the tool is not there, or a fetch ran since the call
+            // arrived and its result stands: nothing more to fetch.
+            if slot.error.is_none() || fetched || slot.generation != generation {
+                return Found::Unknown;
+            }
+            fetched = true;
+            let g = Self::begin_fetch(&mut st, i);
+            drop(st);
+            self.run_fetch(i, g, true);
+            // A newer fetch may have superseded this one; the loop waits
+            // for it.
+            st = lock(&self.state);
         }
-        // Up, and the tool is not there: nothing to fetch.
-        st.slots[i].error.as_ref()?;
-        let generation = Self::begin_fetch(&mut st, i);
-        drop(st);
-        self.run_fetch(i, generation, true);
-        lock(&self.state).catalog.targets.get(name).cloned()
     }
 
     fn on_event(self: &Arc<Self>, name: &str, ev: BackendEvent) {
         match ev {
             BackendEvent::Relay(msg) => {
-                if !self.closing.load(Ordering::SeqCst) {
-                    self.write(&msg);
+                if self.closing.load(Ordering::SeqCst) || self.below_log_level(&msg) {
+                    return;
                 }
+                self.write(&msg);
             }
             BackendEvent::ToolsChanged => {
                 let Some(i) = self.index_of(name) else { return };
                 if self.closing.load(Ordering::SeqCst) {
                     return;
                 }
-                // Not on the backend's own thread: list_tools waits for it.
-                let s = self.clone();
-                if let Err(e) = thread::Builder::new()
-                    .name(format!("mh-refetch-{name}"))
-                    .spawn(move || s.fetch(i, false))
-                {
-                    log(&format!("backend {name:?}: cannot refetch its tools: {e}"));
+                let mut st = lock(&self.state);
+                if st.slots[i].fetching {
+                    // Coalesced: the running fetch lists again when it ends.
+                    st.slots[i].dirty = true;
+                } else {
+                    // Not on the backend's own thread: list_tools waits for it.
+                    self.spawn_fetch(&mut st, i, false, "refetch");
                 }
             }
             BackendEvent::Exited(why) => {
@@ -738,6 +814,7 @@ impl Shared {
             "ping" => self.send_result(id, Value::obj(vec![])),
             "tools/list" => self.on_list(id, &params),
             "tools/call" => self.on_call(id, &params),
+            "logging/setLevel" => self.on_set_level(id, &params),
             other => self.send_error(
                 id,
                 METHOD_NOT_FOUND,
@@ -747,11 +824,48 @@ impl Shared {
         }
     }
 
+    /// A relayed `notifications/message` below the level the client set.
+    fn below_log_level(&self, msg: &Value) -> bool {
+        if msg.get("method").and_then(Value::as_str) != Some("notifications/message") {
+            return false;
+        }
+        let level = msg
+            .get("params")
+            .and_then(|p| p.get("level"))
+            .and_then(Value::as_str)
+            .and_then(|l| LOG_LEVELS.iter().position(|x| *x == l));
+        level.is_some_and(|l| l < self.log_min.load(Ordering::SeqCst))
+    }
+
+    fn on_set_level(&self, id: Value, params: &Value) {
+        let level = params.get("level").and_then(Value::as_str);
+        match level.and_then(|l| LOG_LEVELS.iter().position(|x| *x == l)) {
+            Some(l) => {
+                self.log_min.store(l, Ordering::SeqCst);
+                self.send_result(id, Value::obj(vec![]));
+            }
+            None => self.send_error(
+                id,
+                INVALID_PARAMS,
+                format!(
+                    "logging/setLevel: params.level must be one of {}",
+                    LOG_LEVELS.join(", ")
+                ),
+                None,
+            ),
+        }
+    }
+
     fn on_notification(&self, method: &str, params: &Value) {
         if method == "notifications/cancelled" {
             if let Some(req) = params.get("requestId") {
-                if let Some(token) = lock(&self.inflight).get(&req.to_json()) {
+                let token = lock(&self.inflight).get(&req.to_json()).cloned();
+                if let Some(token) = token {
                     token.cancel();
+                    // Wake a call waiting on a fetch; under the state lock,
+                    // so it cannot miss this between its check and its wait.
+                    let _st = lock(&self.state);
+                    self.state_cv.notify_all();
                 }
             }
         }
@@ -771,10 +885,14 @@ impl Shared {
             ("protocolVersion", Value::str(version)),
             (
                 "capabilities",
-                Value::obj(vec![(
-                    "tools",
-                    Value::obj(vec![("listChanged", Value::Bool(true))]),
-                )]),
+                Value::obj(vec![
+                    (
+                        "tools",
+                        Value::obj(vec![("listChanged", Value::Bool(true))]),
+                    ),
+                    // Backends' notifications/message are relayed.
+                    ("logging", Value::obj(vec![])),
+                ]),
             ),
             (
                 "serverInfo",
@@ -821,7 +939,7 @@ impl Shared {
         let s = self.clone();
         self.spawn_tracked("tools-list", Some(id.clone()), move || {
             let mut st = lock(&s.state);
-            while !Self::all_settled(&st) {
+            while !Self::all_settled(&st) && !s.closing.load(Ordering::SeqCst) {
                 let now = Instant::now();
                 if now >= deadline {
                     break;
@@ -866,19 +984,38 @@ impl Shared {
         let meta = params.get("_meta").cloned();
         let key = id.to_json();
         let token = CancelToken::new();
-        lock(&self.inflight).insert(key.clone(), token.clone());
+        {
+            let mut inflight = lock(&self.inflight);
+            if inflight.contains_key(&key) {
+                drop(inflight);
+                return self.send_error(
+                    id,
+                    INVALID_REQUEST,
+                    format!(
+                        "invalid request: id {key} is already used by a request still in flight; \
+                         use a new id for each request"
+                    ),
+                    None,
+                );
+            }
+            inflight.insert(key.clone(), token.clone());
+        }
         let s = self.clone();
         let name = name.to_string();
         let k = key.clone();
         let spawned = self.spawn_tracked(&format!("call-{name}"), Some(id.clone()), move || {
             let reply = catch_unwind(AssertUnwindSafe(|| {
-                let target = match pending {
-                    Ok(t) => Some(t),
-                    Err(i) => s.fetch_for_call(i, &name),
+                let found = match pending {
+                    Ok(t) => Found::Target(t),
+                    Err((i, generation, busy)) => {
+                        s.fetch_for_call(i, generation, busy, &name, &token)
+                    }
                 };
-                match target {
-                    Some(t) => s.call(&name, t, arguments, meta, &token),
-                    None => Reply::Error(INVALID_PARAMS, s.unknown_tool(&name), None),
+                match found {
+                    _ if token.is_cancelled() => Reply::None,
+                    Found::Target(t) => s.call(&name, t, arguments, meta, &token),
+                    Found::Unknown => Reply::Error(INVALID_PARAMS, s.unknown_tool(&name), None),
+                    Found::Cancelled => Reply::None,
                 }
             }))
             .unwrap_or_else(|p| {
@@ -1117,6 +1254,46 @@ mod tests {
             }
         }
         assert_eq!(got, ["ab\n", "<too long>", "abcd\n", "\n", "xyz"]);
+    }
+
+    fn read_all(text: &[u8], capacity: usize, cap: usize) -> Vec<String> {
+        let mut r = BufReader::with_capacity(capacity, text);
+        let mut buf = Vec::new();
+        let mut got = Vec::new();
+        loop {
+            match read_line_capped(&mut r, &mut buf, cap).unwrap() {
+                Line::Eof => break,
+                Line::Read => got.push(String::from_utf8(buf.clone()).unwrap()),
+                Line::TooLong => got.push("<too long>".into()),
+            }
+        }
+        got
+    }
+
+    /// The cap is on the content: the `\n` or `\r\n` does not count.
+    #[test]
+    fn cap_excludes_the_terminator() {
+        for capacity in [1, 2, 3, 64] {
+            let got = read_all(
+                b"abcde\nabcdef\nabcde\r\nabcdef\r\nabcd\r\r\nabcde",
+                capacity,
+                5,
+            );
+            assert_eq!(
+                got,
+                [
+                    "abcde\n",
+                    "<too long>",
+                    "abcde\r\n",
+                    "<too long>",
+                    "abcd\r\r\n",
+                    "abcde"
+                ],
+                "capacity {capacity}"
+            );
+            assert_eq!(read_all(b"abcdef", capacity, 5), ["<too long>"]);
+            assert_eq!(read_all(b"abcdefg\n", capacity, 5), ["<too long>"]);
+        }
     }
 
     #[test]

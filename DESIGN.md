@@ -96,6 +96,8 @@ pub fn build(spec: &BackendSpec, env: Vec<(String, String)>, project: &Path, sin
 pub struct NativeTool { pub def: Value, pub run: Arc<dyn Fn(Value) -> Result<Value, String> + Send + Sync> }
 pub fn serve<R: BufRead, W: Write + Send + 'static>(cfg: Config, project: PathBuf, natives: Vec<NativeTool>, input: R, output: W) -> Result<(), String>;
 pub fn serve_with<R, W>(cfg: Config, natives: Vec<NativeTool>, make_backends: impl FnOnce(EventSink) -> Vec<Arc<dyn Backend>>, input: R, output: W) -> Result<(), String>;
+#[non_exhaustive] pub struct Options { pub retry_timer: bool }  // Default: true
+pub fn serve_with_options<R, W>(/* serve_with's arguments */, opts: Options) -> Result<(), String>;
 
 // mh-adapters::relatum
 pub struct Note { pub id: String, pub kind: String, pub summary: String, pub status: String, pub superseded_by: Option<String>, pub tags: Vec<String>, pub author: Option<String>, pub updated: Option<String>, pub body: String }
