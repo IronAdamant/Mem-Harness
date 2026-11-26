@@ -1,0 +1,13 @@
+[package]
+name = "mh-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mh-json = { path = "../mh-json" }
+mh-core = { path = "../mh-core" }
+mh-backend = { path = "../mh-backend" }
+
+

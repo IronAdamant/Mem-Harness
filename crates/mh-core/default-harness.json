@@ -1,0 +1,218 @@
+{
+  "version": 1,
+  "main_agent": "main",
+  "profile": "lean",
+  "profiles": {
+    "lean": {
+      "hub": [
+        { "what": "agents", "why": "lineage and the file-agent map; who and list_agents cover daily use" },
+        { "what": "get_lock_status", "why": "acquire_lock and who report the holder" },
+        { "what": "admin_locks", "why": "operator tool" },
+        { "what": "wait_for_locks", "why": "acquire_lock takes retry" },
+        { "what": "get_conflicts", "why": "diagnostics" },
+        { "what": "get_contention_hotspots", "why": "diagnostics" },
+        { "what": "manage_work_intents", "why": "not used by the harness loop" },
+        { "what": "refresh_lock", "why": "heartbeat renews held locks" },
+        { "what": "acknowledge_broadcast", "why": "broadcast acks are not part of the loop" },
+        { "what": "wait_for_broadcast_acks", "why": "broadcast acks are not part of the loop" },
+        { "what": "cancel_handoff", "why": "rare; CLI has it" },
+        { "what": "notify_change", "why": "Wikifier records changes" }
+      ],
+      "chisel": [
+        { "what": "start_job", "why": "analyze and update queue themselves; job_status and cancel_job stay" },
+        { "what": "optimize_storage", "why": "maintenance; run from the CLI" }
+      ],
+      "stele": [
+        { "what": "embeddings", "why": "no agent writes Tier-2 summaries or vectors; keyword search is enough" }
+      ]
+    }
+  },
+  "brief": {
+    "budget_chars": 8000,
+    "command_timeout_s": 10
+  },
+  "backends": [
+    {
+      "name": "stele",
+      "kind": "stdio-mcp",
+      "command": "stele-context",
+      "args": ["serve-mcp"],
+      "env": { "STELE_MCP_MODE": "lite" },
+      "disable_env": "STELE_DISABLE",
+      "strip_prefix": "",
+      "disable": [],
+      "role": "code index: search, symbol definitions and references, impact radius"
+    },
+    {
+      "name": "wikifier",
+      "kind": "stdio-mcp",
+      "command": "wikifier",
+      "args": ["mcp"],
+      "env": {},
+      "disable_env": "WIKIFIER_DISABLE",
+      "strip_prefix": "",
+      "disable": [
+        { "what": "map", "why": "import-resolution diagnostics; not needed day to day" },
+        { "what": "status", "why": "repeats session_bootstrap" }
+      ],
+      "role": "file import graph, per-file wiki notes, journal of why files changed"
+    },
+    {
+      "name": "chisel",
+      "kind": "stdio-mcp",
+      "command": "chisel",
+      "args": ["serve-mcp"],
+      "env": {},
+      "disable_env": "CHISEL_DISABLE",
+      "strip_prefix": "",
+      "disable": [],
+      "role": "which tests to run, git history, risk, test-failure issues"
+    },
+    {
+      "name": "trammel",
+      "kind": "stdio-mcp",
+      "command": "trammel",
+      "args": ["mcp"],
+      "env": {},
+      "disable_env": "TRAMMEL_DISABLE",
+      "strip_prefix": "",
+      "disable": [],
+      "role": "multi-file change plans in dependency order, verified on a copy"
+    },
+    {
+      "name": "probatio",
+      "kind": "stdio-mcp",
+      "command": "probatio",
+      "args": ["mcp"],
+      "env": {},
+      "disable_env": "PROBATIO_DISABLE",
+      "strip_prefix": "",
+      "disable": [
+        { "what": "cli", "why": "raw argv passthrough; the core mutate_* tools cover the loop" }
+      ],
+      "role": "mutation testing: changed lines no test checks"
+    },
+    {
+      "name": "hub",
+      "kind": "stdio-mcp",
+      "command": "coordinationhub",
+      "args": ["serve-mcp"],
+      "env": {},
+      "disable_env": "COORDINATIONHUB_DISABLE",
+      "strip_prefix": "",
+      "disable": [
+        { "what": "diagnostics", "why": "no coordination spec is used" }
+      ],
+      "role": "agent registry, file locks, messages, handoffs"
+    },
+    {
+      "name": "relatum",
+      "kind": "stdio-mcp",
+      "command": "relatum-mcp",
+      "args": [],
+      "env": {},
+      "disable_env": "RELATUM_DISABLE",
+      "strip_prefix": "relatum_",
+      "disable": [],
+      "role": "shared notes by reference: decisions, constraints, conventions, findings"
+    },
+    {
+      "name": "libellus",
+      "kind": "stdio-mcp",
+      "command": "libellus-mcp",
+      "args": [],
+      "env": {},
+      "disable_env": "LIBELLUS_DISABLE",
+      "strip_prefix": "libellus_",
+      "disable": [],
+      "role": "private notes, cost ledger, shared task board, compaction brief"
+    },
+    {
+      "name": "adsertio",
+      "kind": "stdio-mcp",
+      "command": "adsertio-mcp",
+      "args": [],
+      "env": {},
+      "disable_env": "",
+      "strip_prefix": "adsertio_",
+      "disable": [],
+      "role": "claims checked against evidence on disk, recomputed on every view"
+    }
+  ],
+  "ownership": [
+    {
+      "feature": "locks",
+      "owner": "hub",
+      "why": "four tools lock files; one lock table avoids two agents each holding a different tool's lock on one file",
+      "disable": { "chisel": ["locks"], "stele": ["locks"], "trammel": ["locks"] }
+    },
+    {
+      "feature": "messages",
+      "owner": "hub",
+      "why": "one channel for agent messages, broadcasts and handoffs",
+      "disable": { "stele": ["messages"] }
+    },
+    {
+      "feature": "task-board",
+      "owner": "libellus",
+      "why": "the board feeds the compaction brief and closes finished work itself (decision 2026-11-26)",
+      "disable": { "hub": ["tasks"] }
+    },
+    {
+      "feature": "sub-agent-registry",
+      "owner": "host",
+      "why": "Claude Code tracks its own sub-agents; the harness names them",
+      "disable": { "hub": ["spawn"] }
+    },
+    {
+      "feature": "rules",
+      "owner": "relatum",
+      "why": "constraints and conventions are Relatum notes only, passed to sub-agents by id (decision 2026-11-26)",
+      "disable": { "trammel": ["add_constraint", "get_constraints", "deactivate_constraint"] }
+    },
+    {
+      "feature": "private-notes",
+      "owner": "libellus",
+      "why": "per-agent questions, decisions and dead ends that must survive compaction",
+      "disable": { "stele": ["notes", "kv"] }
+    },
+    {
+      "feature": "shared-notes",
+      "owner": "relatum",
+      "why": "facts several agents read; Libellus promotes into it",
+      "disable": {}
+    },
+    {
+      "feature": "file-change-journal",
+      "owner": "wikifier",
+      "why": "why each file changed, kept beside the import map",
+      "disable": {}
+    },
+    {
+      "feature": "plan-handoff-notes",
+      "owner": "trammel",
+      "why": "notes scoped to one plan, read by resume",
+      "disable": {}
+    },
+    {
+      "feature": "claims",
+      "owner": "adsertio",
+      "why": "verdicts are computed from evidence, never remembered",
+      "disable": {}
+    }
+  ],
+  "routes": [
+    { "question": "where is a symbol defined, who uses it, is it dead", "tool": "stele_find_references" },
+    { "question": "what breaks if a symbol changes", "tool": "stele_impact_radius" },
+    { "question": "which files import this file", "tool": "wikifier_get_dependents" },
+    { "question": "why was this file changed", "tool": "wikifier_why_file" },
+    { "question": "which tests to run after an edit", "tool": "chisel_diff_impact" },
+    { "question": "which files change together in git", "tool": "chisel_coupling" },
+    { "question": "are the changed lines actually tested", "tool": "probatio_mutate_diff" },
+    { "question": "plan a change across several files", "tool": "trammel_start_plan" },
+    { "question": "a rule or convention every agent must follow", "tool": "relatum_new" },
+    { "question": "a private question, decision or dead end", "tool": "libellus_note" },
+    { "question": "state a result you want checked later", "tool": "adsertio_claim" },
+    { "question": "who holds a file, or message another agent", "tool": "hub_who" }
+  ]
+}

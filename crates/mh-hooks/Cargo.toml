@@ -1,0 +1,11 @@
+[package]
+name = "mh-hooks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mh-json = { path = "../mh-json" }
+mh-core = { path = "../mh-core" }
+mh-adapters = { path = "../mh-adapters" }
