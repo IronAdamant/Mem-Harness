@@ -3,7 +3,7 @@
 use mh_backend::{Backend, BackendEvent, BackendStatus, CallError, CancelToken, EventSink};
 use mh_core::Config;
 use mh_json::{parse, Value};
-use mh_proxy::{serve_with, NativeTool};
+use mh_proxy::{serve_with_options, NativeTool, Options};
 use std::collections::VecDeque;
 use std::io::{BufReader, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -238,6 +238,37 @@ fn start(natives: Vec<NativeTool>, backends: Vec<Arc<Fake>>) -> Harness {
 }
 
 fn start_cfg(cfg: Config, natives: Vec<NativeTool>, backends: Vec<Arc<Fake>>) -> Harness {
+    start_opts(cfg, natives, backends, Options::default())
+}
+
+/// No retry timer: only a list or a call starts a failed backend again.
+fn no_timer() -> Options {
+    let mut o = Options::default();
+    o.retry_timer = false;
+    o
+}
+
+fn start_opts(
+    cfg: Config,
+    natives: Vec<NativeTool>,
+    backends: Vec<Arc<Fake>>,
+    opts: Options,
+) -> Harness {
+    let backends = backends
+        .into_iter()
+        .map(|b| b as Arc<dyn Backend>)
+        .collect();
+    start_dyn(cfg, natives, backends, vec![], opts)
+}
+
+/// Start with any backends; each of `sinks` gets the event sink too.
+fn start_dyn(
+    cfg: Config,
+    natives: Vec<NativeTool>,
+    backends: Vec<Arc<dyn Backend>>,
+    sinks: Vec<Arc<Mutex<Option<EventSink>>>>,
+    opts: Options,
+) -> Harness {
     let (tx, rx) = channel();
     let out = SharedBuf::default();
     let sink = Arc::new(Mutex::new(None));
@@ -247,18 +278,19 @@ fn start_cfg(cfg: Config, natives: Vec<NativeTool>, backends: Vec<Arc<Fake>>) ->
             rx,
             buf: VecDeque::new(),
         });
-        serve_with(
+        serve_with_options(
             cfg,
             natives,
             move |es: EventSink| {
-                *s.lock().unwrap() = Some(es);
+                *s.lock().unwrap() = Some(es.clone());
+                for x in sinks {
+                    *x.lock().unwrap() = Some(es.clone());
+                }
                 backends
-                    .into_iter()
-                    .map(|b| b as Arc<dyn Backend>)
-                    .collect()
             },
             input,
             o,
+            opts,
         )
     });
     Harness {
@@ -419,7 +451,7 @@ fn initialize_negotiates_the_version() {
     );
     assert_eq!(
         res.get("capabilities").unwrap().to_json(),
-        r#"{"tools":{"listChanged":true}}"#
+        r#"{"tools":{"listChanged":true},"logging":{}}"#
     );
     let ins = res.get("instructions").unwrap().as_str().unwrap();
     assert!(
@@ -924,13 +956,14 @@ fn status_of(h: &Harness, id: i64, backend: &str) -> Value {
 }
 
 /// A backend whose first start fails is fetched again by a call under its
-/// prefix: the call is routed and the client hears list_changed.
+/// prefix: the call is routed and the client hears list_changed. No retry
+/// timer, so only the call can have brought it back.
 #[test]
 fn failed_first_start_is_retried_by_a_call() {
     let (a, r, _) = three();
     let beta = Arc::new(Fake::new("beta", &["echo"]));
     beta.flaky_starts.store(1, Ordering::SeqCst);
-    let h = start(vec![], vec![a, r, beta.clone()]);
+    let h = start_opts(cfg(), vec![], vec![a, r, beta.clone()], no_timer());
     h.init();
     assert!(!h.tool_names(1).contains(&"beta_echo".to_string()));
     let v = h.request(2, "tools/call", r#"{"name":"beta_echo"}"#);
@@ -959,13 +992,14 @@ fn failed_first_start_is_retried_by_the_timer() {
     assert_eq!(out.iter().filter(|v| is_list_changed(v)).count(), 1);
 }
 
-/// A call under a backend that keeps failing tries it again and says why.
+/// A call under a backend that keeps failing tries it again, exactly once,
+/// and says why. No retry timer, so every start is counted.
 #[test]
 fn call_under_a_failing_backend_reports_its_error() {
     let (a, r, _) = three();
     let beta = Arc::new(Fake::new("beta", &["echo"]));
     beta.flaky_starts.store(1000, Ordering::SeqCst);
-    let h = start(vec![], vec![a, r, beta.clone()]);
+    let h = start_opts(cfg(), vec![], vec![a, r, beta.clone()], no_timer());
     h.init();
     h.tool_names(1);
     let before = beta.flaky_starts.load(Ordering::SeqCst);
@@ -977,9 +1011,10 @@ fn call_under_a_failing_backend_reports_its_error() {
         m.contains("backend \"beta\" failed") && m.contains("no initialize reply"),
         "{m}"
     );
-    assert!(
-        beta.flaky_starts.load(Ordering::SeqCst) < before,
-        "not retried"
+    assert_eq!(
+        before - beta.flaky_starts.load(Ordering::SeqCst),
+        1,
+        "the call should start the backend exactly once"
     );
     h.finish();
 }
@@ -1136,5 +1171,443 @@ fn over_long_line_is_skipped() {
     let e = out[0].get("error").unwrap();
     assert_eq!(e.get("code").unwrap().as_i64(), Some(-32700));
     assert!(out[0].get("id").unwrap().is_null());
+    assert_eq!(out[1].get("id").unwrap().to_json(), "2");
+}
+
+// ---------- regressions from the second review ----------
+
+/// A backend whose behaviour is scripted per start attempt.
+struct Scripted {
+    name: String,
+    /// Start attempts so far.
+    starts: AtomicU32,
+    /// Each start sleeps this long.
+    start_ms: u64,
+    /// Starts numbered (1-based) at or below this fail.
+    fail_first: u32,
+    /// When set, the first start blocks until it is opened.
+    gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+    /// A successful start reports ToolsChanged through this sink.
+    sink: Arc<Mutex<Option<EventSink>>>,
+    emit_on_start: bool,
+    lists: AtomicU32,
+    /// Every list_tools after the first sleeps this long.
+    later_list_ms: u64,
+    calls: AtomicU32,
+}
+
+impl Scripted {
+    fn new(name: &str) -> Scripted {
+        Scripted {
+            name: name.into(),
+            starts: AtomicU32::new(0),
+            start_ms: 0,
+            fail_first: 0,
+            gate: None,
+            sink: Arc::new(Mutex::new(None)),
+            emit_on_start: false,
+            lists: AtomicU32::new(0),
+            later_list_ms: 0,
+            calls: AtomicU32::new(0),
+        }
+    }
+    fn starts(&self) -> u32 {
+        self.starts.load(Ordering::SeqCst)
+    }
+}
+
+impl Backend for Scripted {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn start(&self) -> Result<(), CallError> {
+        let n = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
+        if n == 1 {
+            if let Some(g) = &self.gate {
+                let mut open = g.0.lock().unwrap();
+                while !*open {
+                    open = g.1.wait(open).unwrap();
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(self.start_ms));
+        if n <= self.fail_first {
+            return Err(CallError::Unavailable(format!("start #{n} failed")));
+        }
+        if self.emit_on_start {
+            if let Some(s) = self.sink.lock().unwrap().clone() {
+                s(&self.name, BackendEvent::ToolsChanged);
+            }
+        }
+        Ok(())
+    }
+    fn status(&self) -> BackendStatus {
+        BackendStatus::default()
+    }
+    fn list_tools(&self) -> Result<Vec<Value>, CallError> {
+        if self.lists.fetch_add(1, Ordering::SeqCst) > 0 {
+            thread::sleep(Duration::from_millis(self.later_list_ms));
+        }
+        Ok(vec![tool("echo")])
+    }
+    fn call_tool(
+        &self,
+        tool: &str,
+        _: Value,
+        _: Option<Value>,
+        _: &CancelToken,
+    ) -> Result<Value, CallError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Value::obj(vec![(
+            "content",
+            Value::Array(vec![Value::obj(vec![
+                ("type", Value::str("text")),
+                ("text", Value::str(format!("ran {tool}"))),
+            ])]),
+        )]))
+    }
+    fn shutdown(&self) {}
+}
+
+fn start_scripted(beta: &Arc<Scripted>, opts: Options) -> Harness {
+    start_dyn(
+        cfg(),
+        vec![],
+        vec![beta.clone() as Arc<dyn Backend>],
+        vec![beta.sink.clone()],
+        opts,
+    )
+}
+
+fn gate_open(gate: &(Mutex<bool>, Condvar)) {
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
+}
+
+/// Concurrent calls under a failed backend share one start: each call that
+/// waited on a fetch takes its result instead of starting the backend again.
+#[test]
+fn concurrent_calls_under_a_failed_backend_share_one_start() {
+    let beta = Arc::new(Scripted {
+        start_ms: 300,
+        fail_first: u32::MAX,
+        ..Scripted::new("beta")
+    });
+    let h = start_scripted(&beta, no_timer());
+    h.init();
+    h.tool_names(1); // waits for the startup fetch to fail
+    let t0 = Instant::now();
+    let before = beta.starts();
+    for id in 10..15 {
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"beta_echo"}}}}"#
+        ));
+    }
+    for id in 10..15 {
+        let v = h.reply(&id.to_string());
+        let m = v.get("error").unwrap().get("message").unwrap().to_json();
+        assert!(m.contains("failed"), "{m}");
+    }
+    let took = t0.elapsed();
+    let starts = beta.starts() - before;
+    h.finish();
+    assert_eq!(starts, 1, "5 concurrent calls caused {starts} starts");
+    // Serial starts would take 5 x 300 ms.
+    assert!(took < Duration::from_millis(1200), "took {took:?}");
+}
+
+/// A call that arrives while a fetch runs takes that fetch's result, even
+/// when it fails: it does not start the backend again.
+#[test]
+fn call_that_waited_on_a_failed_fetch_takes_its_result() {
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let beta = Arc::new(Scripted {
+        fail_first: u32::MAX,
+        gate: Some(gate.clone()),
+        ..Scripted::new("beta")
+    });
+    let h = start_scripted(&beta, no_timer());
+    h.init();
+    h.send(r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"beta_echo"}}"#);
+    h.request(1, "ping", "{}");
+    gate_open(&gate);
+    let v = h.reply("5");
+    let m = v.get("error").unwrap().get("message").unwrap().to_json();
+    assert!(m.contains("start #1 failed"), "{m}");
+    h.finish();
+    assert_eq!(beta.starts(), 1);
+}
+
+/// A call cancelled while it waits for its backend's fetch stops: no
+/// further start, no backend call, no reply.
+#[test]
+fn cancelled_call_waiting_on_a_fetch_does_no_more_work() {
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let beta = Arc::new(Scripted {
+        fail_first: 1,
+        gate: Some(gate.clone()),
+        ..Scripted::new("beta")
+    });
+    let h = start_scripted(&beta, no_timer());
+    h.init();
+    h.send(r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"beta_echo"}}"#);
+    h.request(1, "ping", "{}");
+    h.send(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":20}}"#);
+    h.request(2, "ping", "{}");
+    gate_open(&gate);
+    // The status call runs after the startup fetch settles.
+    let st = status_of(&h, 3, "beta");
+    assert_eq!(st.get("state").unwrap().as_str(), Some("failed"));
+    let out = h.finish();
+    assert_eq!(beta.starts(), 1, "the cancelled call started the backend");
+    assert_eq!(beta.calls.load(Ordering::SeqCst), 0);
+    assert!(
+        !out.iter()
+            .any(|v| v.get("id").map(Value::to_json).as_deref() == Some("20")),
+        "{out:?}"
+    );
+}
+
+/// The cancel wakes a waiting call at once: shutdown is not held up by it.
+#[test]
+fn cancel_wakes_a_call_waiting_on_a_fetch() {
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let beta = Arc::new(Scripted {
+        gate: Some(gate.clone()),
+        ..Scripted::new("beta")
+    });
+    let h = start_scripted(&beta, no_timer());
+    h.init();
+    h.send(r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"beta_echo"}}"#);
+    h.request(1, "ping", "{}");
+    h.send(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":20}}"#);
+    // Reuse id 20 until it is answered (not -32600): the cancelled call
+    // has ended while its backend is still starting.
+    let deadline = Instant::now() + DEADLINE;
+    let mut id = 100;
+    loop {
+        h.send(
+            r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"harness_status"}}"#,
+        );
+        h.request(id, "ping", "{}");
+        id += 1;
+        let ok = h.lines().iter().any(|v| {
+            v.get("id").map(Value::to_json).as_deref() == Some("20") && v.get("result").is_some()
+        });
+        if ok {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the cancelled call kept waiting");
+        thread::sleep(Duration::from_millis(5));
+    }
+    gate_open(&gate);
+    h.finish();
+}
+
+/// A ToolsChanged arriving while a call's own fetch runs: the call is
+/// still routed (it waits for the newer listing instead of answering
+/// "unknown tool"), and the refetch it causes runs once.
+#[test]
+fn call_fetch_with_tools_changed_still_routes() {
+    let beta = Arc::new(Scripted {
+        fail_first: 1,
+        emit_on_start: true,
+        later_list_ms: 300,
+        ..Scripted::new("beta")
+    });
+    let h = start_scripted(&beta, no_timer());
+    h.init();
+    h.tool_names(1); // startup fetch failed
+    let v = h.request(2, "tools/call", r#"{"name":"beta_echo"}"#);
+    assert!(
+        v.get("error").is_none(),
+        "call to a tool the backend lists failed: {}",
+        v.to_json()
+    );
+    assert_eq!(text_of(&v), "ran echo");
+    let end = Instant::now() + DEADLINE;
+    while beta.lists.load(Ordering::SeqCst) < 2 {
+        assert!(Instant::now() < end, "no refetch after ToolsChanged");
+        thread::sleep(Duration::from_millis(1));
+    }
+    h.finish();
+    assert_eq!(beta.lists.load(Ordering::SeqCst), 2);
+}
+
+/// Several ToolsChanged while a refetch runs cause one more refetch, not
+/// one each.
+#[test]
+fn tools_changed_refetches_are_coalesced() {
+    let beta = Arc::new(Scripted {
+        later_list_ms: 200,
+        ..Scripted::new("beta")
+    });
+    let h = start_scripted(&beta, no_timer());
+    h.init();
+    h.tool_names(1);
+    for _ in 0..5 {
+        h.emit("beta", BackendEvent::ToolsChanged);
+    }
+    let end = Instant::now() + DEADLINE;
+    while beta.lists.load(Ordering::SeqCst) < 3 {
+        assert!(
+            Instant::now() < end,
+            "lists: {}",
+            beta.lists.load(Ordering::SeqCst)
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    thread::sleep(Duration::from_millis(500));
+    h.finish();
+    // The startup list, one refetch, and one for the events during it.
+    assert_eq!(beta.lists.load(Ordering::SeqCst), 3);
+}
+
+/// The proxy relays notifications/message, so it declares `logging`, and
+/// `logging/setLevel` filters what it relays.
+#[test]
+fn logging_is_declared_and_set_level_filters_relayed_messages() {
+    let (a, r, b) = three();
+    let h = start(vec![], vec![a, r, b]);
+    let init = h.request(0, "initialize", r#"{"protocolVersion":"2025-11-25"}"#);
+    let caps = init.get("result").unwrap().get("capabilities").unwrap();
+    assert_eq!(
+        caps.get("logging").map(Value::to_json).as_deref(),
+        Some("{}")
+    );
+    let msg = |level: &str, data: &str| {
+        parse(&format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/message","params":{{"level":"{level}","data":"{data}"}}}}"#
+        ))
+        .unwrap()
+    };
+    let set = h.request(1, "logging/setLevel", r#"{"level":"warning"}"#);
+    assert_eq!(set.get("result").unwrap().to_json(), "{}");
+    let bad = h.request(2, "logging/setLevel", r#"{"level":"loud"}"#);
+    assert_eq!(
+        bad.get("error").unwrap().get("code").unwrap().as_i64(),
+        Some(-32602)
+    );
+    h.emit("alpha", BackendEvent::Relay(msg("info", "quiet")));
+    h.emit("alpha", BackendEvent::Relay(msg("error", "loud")));
+    h.emit("alpha", BackendEvent::Relay(msg("weird", "unknown level")));
+    h.request(3, "ping", "{}");
+    let out = h.finish();
+    let data: Vec<String> = out
+        .iter()
+        .filter(|v| v.get("method").and_then(Value::as_str) == Some("notifications/message"))
+        .map(|v| v.get("params").unwrap().get("data").unwrap().to_json())
+        .collect();
+    assert_eq!(data, [r#""loud""#, r#""unknown level""#]);
+}
+
+/// A second call with the id of a call still in flight is rejected; the
+/// first one still gets its reply.
+#[test]
+fn duplicate_in_flight_id_is_rejected() {
+    let (a, r, b) = three();
+    let h = start(vec![], vec![a.clone(), r, b]);
+    h.init();
+    h.tool_names(1);
+    h.send(r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"alpha_slow"}}"#);
+    a.wait_until("the slow call", || !a.calls.lock().unwrap().is_empty());
+    let v = h.request(7, "tools/call", r#"{"name":"alpha_echo"}"#);
+    assert_eq!(
+        v.get("error").unwrap().get("code").unwrap().as_i64(),
+        Some(-32600),
+        "{}",
+        v.to_json()
+    );
+    a.release.store(true, Ordering::SeqCst);
+    let end = Instant::now() + DEADLINE;
+    loop {
+        let replies: Vec<Value> = h
+            .lines()
+            .into_iter()
+            .filter(|v| v.get("id").map(Value::to_json).as_deref() == Some("7"))
+            .collect();
+        if replies.len() == 2 {
+            assert_eq!(text_of(&replies[1]), "slow done");
+            break;
+        }
+        assert!(Instant::now() < end, "no reply to the first call");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(a.calls.lock().unwrap().len(), 1);
+    h.finish();
+}
+
+/// Input EOF while the first tools/list waits for a starting backend: the
+/// list thread stops waiting, and shutdown takes one drain, not two.
+#[test]
+fn shutdown_does_not_wait_out_a_pending_first_list() {
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let beta = Arc::new(Scripted {
+        gate: Some(gate.clone()),
+        ..Scripted::new("beta")
+    });
+    let h = start_scripted(&beta, Options::default());
+    h.init();
+    h.send(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+    h.request(2, "ping", "{}");
+    let t0 = Instant::now();
+    let opener = {
+        let gate = gate.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(5));
+            gate_open(&gate);
+        })
+    };
+    h.finish();
+    let took = t0.elapsed();
+    opener.join().unwrap();
+    assert!(took < Duration::from_secs(4), "shutdown took {took:?}");
+}
+
+/// A message of exactly MAX_LINE bytes is served, ended by LF or by CRLF:
+/// the terminator does not count against the cap.
+#[test]
+fn line_of_exactly_max_line_bytes_is_served() {
+    let h = start(vec![], vec![]);
+    for (id, end) in [(1, &b"\n"[..]), (2, &b"\r\n"[..])] {
+        let head = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping","params":{{"pad":""#);
+        let tail = b"\"}}";
+        let mut line = head.into_bytes();
+        line.resize(mh_proxy::MAX_LINE - tail.len(), b' ');
+        line.extend_from_slice(tail);
+        assert_eq!(line.len(), mh_proxy::MAX_LINE);
+        line.extend_from_slice(end);
+        h.tx.as_ref().unwrap().send(line).unwrap();
+    }
+    h.request(3, "ping", "{}");
+    let out = h.finish();
+    let ids: Vec<String> = out
+        .iter()
+        .map(|v| {
+            assert!(v.get("error").is_none(), "{}", v.to_json());
+            v.get("id").unwrap().to_json()
+        })
+        .collect();
+    assert_eq!(ids, ["1", "2", "3"]);
+}
+
+/// One byte over the cap (not counting the terminator) is rejected.
+#[test]
+fn line_one_byte_over_max_line_is_skipped() {
+    let h = start(vec![], vec![]);
+    let head = br#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{"pad":""#;
+    let tail = b"\"}}";
+    let mut line = head.to_vec();
+    line.resize(mh_proxy::MAX_LINE + 1 - tail.len(), b' ');
+    line.extend_from_slice(tail);
+    line.extend_from_slice(b"\r\n");
+    h.tx.as_ref().unwrap().send(line).unwrap();
+    h.request(2, "ping", "{}");
+    let out = h.finish();
+    assert_eq!(out.len(), 2, "{out:?}");
+    assert_eq!(
+        out[0].get("error").unwrap().get("code").unwrap().as_i64(),
+        Some(-32700)
+    );
     assert_eq!(out[1].get("id").unwrap().to_json(), "2");
 }

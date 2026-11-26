@@ -78,7 +78,11 @@ pub struct BackendSpec {
     pub hide_tools: Vec<String>,
     /// When not empty, the proxy shows only tools matching one of these.
     pub only_tools: Vec<String>,
-    /// The whole JSON object of this backend, for kind-specific settings.
+    /// Leave processes the server started running when its connection ends
+    /// (normally the whole process group is stopped with it).
+    pub keep_children: bool,
+    /// The whole JSON object of this backend; kind-specific settings live
+    /// under its `settings` key.
     pub raw: Value,
 }
 
@@ -100,6 +104,7 @@ impl BackendSpec {
             env_pass: None,
             hide_tools: Vec::new(),
             only_tools: Vec::new(),
+            keep_children: false,
             raw: Value::obj(vec![]),
         }
     }
@@ -138,6 +143,8 @@ pub struct SectionSpec {
     pub heading: String,
     /// Run only when this path exists in the project (for example `.chisel`).
     pub only_if_exists: String,
+    /// The MCP tool the brief's "trimmed" note points to; default `name`.
+    pub tool: String,
 }
 
 /// The `parse` values a section may use.
@@ -157,6 +164,9 @@ pub struct Ownership {
     pub why: String,
     /// Backend name -> groups or tools to hide there.
     pub disable: BTreeMap<String, Vec<String>>,
+    /// Groups and tools of the owner that serve this feature. No trim may
+    /// hide them (the feature's own name is always protected too).
+    pub protect: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -201,18 +211,12 @@ pub struct Config {
 }
 
 /// Top-level keys a project's `.mem-harness/harness.json` may set. It is
-/// read from whatever repository Claude Code opens, so it cannot name
-/// commands or environment: `backends`, `stores` and `brief_sections` come
-/// only from the user's own config.
-pub const PROJECT_KEYS: &[&str] = &[
-    "version",
-    "profile",
-    "profiles",
-    "brief",
-    "main_agent",
-    "routes",
-    "ownership",
-];
+/// read from whatever repository Claude Code opens, so it can only pick a
+/// profile the user defined and change brief settings. Everything that
+/// runs commands, hides tools, or writes text the model reads as the
+/// harness's guidance (`backends`, `stores`, `brief_sections`, `profiles`,
+/// `ownership`, `routes`) comes only from the user's own config.
+pub const PROJECT_KEYS: &[&str] = &["version", "profile", "brief", "main_agent"];
 
 const ALL_KEYS: &[&str] = &[
     "version",
@@ -266,10 +270,21 @@ impl Config {
     /// is then laid over it, limited to [`PROJECT_KEYS`]. Last,
     /// `$MEM_HARNESS_PROFILE` picks the profile. Every problem is an `Err`.
     pub fn load(project: &Path) -> Result<Config, String> {
-        let explicit = std::env::var("MEM_HARNESS_CONFIG")
-            .ok()
-            .filter(|p| !p.trim().is_empty())
-            .map(PathBuf::from);
+        let explicit = match std::env::var("MEM_HARNESS_CONFIG") {
+            Ok(p) if !p.trim().is_empty() => {
+                let p = PathBuf::from(p.trim());
+                // A relative path would be read from the folder Claude Code
+                // was opened in, which is the repository: not the user's own.
+                if !p.is_absolute() {
+                    return Err(format!(
+                        "MEM_HARNESS_CONFIG {} must be an absolute path",
+                        p.display()
+                    ));
+                }
+                Some(p)
+            }
+            _ => None,
+        };
         let base_path = explicit
             .clone()
             .or_else(|| user_config_path().filter(|p| p.is_file()));
@@ -498,11 +513,16 @@ impl Config {
                     "{ctx}: hides {what:?} in {b:?}, which has no disable_env, so nothing would be hidden; use hide_tools for it"
                 ));
             }
-            if let Some(o) = self
-                .ownership
-                .iter()
-                .find(|o| &o.owner == b && o.feature.eq_ignore_ascii_case(what))
-            {
+            if !valid_trim(what) {
+                return Err(format!(
+                    "{ctx}: trim {what:?} in {b:?}: use one group or tool name (letters, digits, '_' and '-')"
+                ));
+            }
+            if let Some(o) = self.ownership.iter().find(|o| {
+                &o.owner == b
+                    && (o.feature.eq_ignore_ascii_case(what)
+                        || o.protect.iter().any(|p| p.eq_ignore_ascii_case(what)))
+            }) {
                 return Err(format!(
                     "{ctx}: hides {what:?} in {b:?}, which owns the feature {:?}",
                     o.feature
@@ -699,7 +719,7 @@ fn apply_overlay(base: &mut Value, overlay: &Value) -> Result<(), String> {
                 .unwrap_or_else(|| "~/.mem-harness/harness.json".into());
             return Err(if ALL_KEYS.contains(&k.as_str()) {
                 format!(
-                    "\"{k}\" may name commands, so a project file cannot set it; put it in {user} or $MEM_HARNESS_CONFIG"
+                    "\"{k}\" can run commands, hide tools or instruct the model, so a project file cannot set it; put it in {user} or $MEM_HARNESS_CONFIG"
                 )
             } else {
                 format!(
@@ -718,6 +738,30 @@ fn apply_overlay(base: &mut Value, overlay: &Value) -> Result<(), String> {
                 }
             }
             _ => base.set(k, val.clone()),
+        }
+    }
+    Ok(())
+}
+
+/// One group or tool name, as the backends' `*_DISABLE` lists take them.
+/// Commas, spaces and control characters would split or break the list.
+fn valid_trim(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+}
+
+/// Reject keys of `v` not in `known` (`ctx` names the object).
+fn known_keys(v: &Value, known: &[&str], ctx: &str) -> Result<(), String> {
+    if let Some(pairs) = v.as_object() {
+        for (k, _) in pairs {
+            if !known.contains(&k.as_str()) && k != "$comment" {
+                return Err(format!(
+                    "{ctx}: unknown key \"{k}\" (known: {})",
+                    known.join(", ")
+                ));
+            }
         }
     }
     Ok(())
@@ -836,6 +880,18 @@ fn parse_config(v: &Value, _source: &str) -> Result<Config, String> {
     if b.as_object().is_none() {
         return Err("\"brief\" must be an object".into());
     }
+    known_keys(
+        &b,
+        &[
+            "budget_chars",
+            "command_timeout_s",
+            "nudge_on_stop",
+            "save_unrecorded_on_compact",
+            "save_tools",
+            "edit_tools",
+        ],
+        "brief",
+    )?;
     let brief = BriefConfig {
         budget_chars: int_in(&b, "budget_chars", 8000, 500, 100_000, "brief")? as usize,
         command_timeout_s: int_in(&b, "command_timeout_s", 10, 1, 120, "brief")?,
@@ -860,6 +916,28 @@ fn parse_config(v: &Value, _source: &str) -> Result<Config, String> {
         .enumerate()
     {
         let ctx = format!("backends[{i}]");
+        known_keys(
+            b,
+            &[
+                "name",
+                "kind",
+                "command",
+                "args",
+                "env",
+                "disable_env",
+                "strip_prefix",
+                "disable",
+                "role",
+                "handshake_s",
+                "call_s",
+                "env_pass",
+                "hide_tools",
+                "only_tools",
+                "keep_children",
+                "settings",
+            ],
+            &ctx,
+        )?;
         let env = match b.get("env") {
             None => Vec::new(),
             Some(Value::Object(pairs)) => pairs
@@ -916,6 +994,7 @@ fn parse_config(v: &Value, _source: &str) -> Result<Config, String> {
             },
             hide_tools: str_list(b.get("hide_tools"), &format!("{ctx}.hide_tools"))?,
             only_tools: str_list(b.get("only_tools"), &format!("{ctx}.only_tools"))?,
+            keep_children: bool_or(b, "keep_children", false, &ctx)?,
             raw: b.clone(),
         });
     }
@@ -929,6 +1008,7 @@ fn parse_config(v: &Value, _source: &str) -> Result<Config, String> {
             .enumerate()
         {
             let ctx = format!("ownership[{i}]");
+            known_keys(o, &["feature", "owner", "why", "disable", "protect"], &ctx)?;
             let mut disable = BTreeMap::new();
             if let Some(d) = o.get("disable") {
                 for (k, val) in d
@@ -946,6 +1026,7 @@ fn parse_config(v: &Value, _source: &str) -> Result<Config, String> {
                 owner: str_field(o, "owner", &ctx)?,
                 why: opt_str(o, "why"),
                 disable,
+                protect: str_list(o.get("protect"), &format!("{ctx}.protect"))?,
             });
         }
     }
@@ -959,6 +1040,7 @@ fn parse_config(v: &Value, _source: &str) -> Result<Config, String> {
             .enumerate()
         {
             let ctx = format!("routes[{i}]");
+            known_keys(r, &["question", "tool"], &ctx)?;
             routes.push(Route {
                 question: str_field(r, "question", &ctx)?,
                 tool: str_field(r, "tool", &ctx)?,
@@ -999,6 +1081,7 @@ fn parse_config(v: &Value, _source: &str) -> Result<Config, String> {
             .enumerate()
         {
             let ctx = format!("stores[{i}]");
+            known_keys(st, &["tool", "dir", "env", "init", "save_hint"], &ctx)?;
             stores.push(StoreSpec {
                 tool: str_field(st, "tool", &ctx)?,
                 dir: str_field(st, "dir", &ctx)?,
@@ -1017,6 +1100,20 @@ fn parse_config(v: &Value, _source: &str) -> Result<Config, String> {
             .enumerate()
         {
             let ctx = format!("brief_sections[{i}]");
+            known_keys(
+                sec,
+                &[
+                    "name",
+                    "parse",
+                    "command",
+                    "args",
+                    "weight",
+                    "heading",
+                    "only_if_exists",
+                    "tool",
+                ],
+                &ctx,
+            )?;
             brief_sections.push(SectionSpec {
                 name: str_field(sec, "name", &ctx)?,
                 parse: str_field(sec, "parse", &ctx)?,
@@ -1025,6 +1122,10 @@ fn parse_config(v: &Value, _source: &str) -> Result<Config, String> {
                 weight: int_in(sec, "weight", 10, 0, 1000, &ctx)? as usize,
                 heading: opt_str(sec, "heading"),
                 only_if_exists: opt_str(sec, "only_if_exists"),
+                tool: match opt_str(sec, "tool") {
+                    t if t.is_empty() => str_field(sec, "name", &ctx)?,
+                    t => t,
+                },
             });
         }
     }
@@ -1113,10 +1214,13 @@ fn parse_trims(list: &Value, ctx: &str) -> Result<Vec<Trim>, String> {
                 what: s.clone(),
                 why: String::new(),
             }),
-            _ => Ok(Trim {
-                what: str_field(d, "what", ctx)?,
-                why: opt_str(d, "why"),
-            }),
+            _ => {
+                known_keys(d, &["what", "why"], ctx)?;
+                Ok(Trim {
+                    what: str_field(d, "what", ctx)?,
+                    why: opt_str(d, "why"),
+                })
+            }
         })
         .collect()
 }

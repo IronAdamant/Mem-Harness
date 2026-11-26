@@ -142,9 +142,12 @@ fn handshake_fills_status_and_start_is_idempotent() {
             .and_then(Value::as_str),
         Some("mem-harness")
     );
-    assert!(log
+    // `initialized` is queued, not waited for: the fake logs it a moment later.
+    assert!(wait_for(|| logged(&f)
         .iter()
-        .any(|m| m.get("method").and_then(Value::as_str) == Some("notifications/initialized")));
+        .any(
+            |m| m.get("method").and_then(Value::as_str) == Some("notifications/initialized")
+        )));
     assert_eq!(
         log.iter()
             .filter(|m| m.get("method").and_then(Value::as_str) == Some("initialize"))

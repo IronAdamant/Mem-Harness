@@ -28,8 +28,17 @@ impl Value {
         Value::Num(n.to_string())
     }
 
+    /// An object from pairs. A repeated key keeps one entry with the last
+    /// value, as parsing does, so `get`, `set` and `remove` agree.
     pub fn obj(pairs: Vec<(&str, Value)>) -> Value {
-        Value::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+        let mut out: Vec<(String, Value)> = Vec::with_capacity(pairs.len());
+        for (k, v) in pairs {
+            match out.iter_mut().find(|(e, _)| e == k) {
+                Some(slot) => slot.1 = v,
+                None => out.push((k.to_string(), v)),
+            }
+        }
+        Value::Object(out)
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {
@@ -435,6 +444,14 @@ mod tests {
         assert_eq!(v.get("name").and_then(Value::as_str), Some("c"));
         v.remove("name");
         assert!(v.get("name").is_none());
+    }
+
+    #[test]
+    fn obj_with_a_repeated_key_keeps_the_last() {
+        let mut v = Value::obj(vec![("a", Value::int(1)), ("a", Value::int(2))]);
+        assert_eq!(v.to_json(), r#"{"a":2}"#);
+        v.set("a", Value::int(3));
+        assert_eq!(v.get("a").and_then(Value::as_i64), Some(3));
     }
 
     #[test]

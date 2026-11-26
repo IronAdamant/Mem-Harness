@@ -39,8 +39,10 @@ In order, they:
    `claude mcp add --scope user mem-harness -- <path> mcp`, and remove the
    per-tool servers it replaces;
 2. give the `hooks` block to merge into `~/.claude/settings.json`, in place
-   of the Libellus and Adsertio hooks. It wires SessionStart, SubagentStart,
-   PreCompact, PostCompact, Stop and SubagentStop to `mem-harness hook <event>`.
+   of the Libellus and Adsertio hooks. It wires SessionStart,
+   UserPromptSubmit, SubagentStart, PreCompact, PostCompact, Stop and
+   SubagentStop to `mem-harness hook <event>`. If you installed an earlier
+   version, run it again and add the new `UserPromptSubmit` entry.
 
 Restart Claude Code, and `/mcp` should show `mem-harness` connected. Old
 servers or hooks left in place show every tool and the brief twice.
@@ -57,8 +59,13 @@ Two hooks cover what was not saved:
   A line saved by an earlier compact is not saved again, and one line
   Libellus refuses does not lose the others.
 - **When a turn edits files but saves nothing**, the agent is asked once to
-  save its decisions, rules or results before it stops. This costs one extra
-  round trip on such turns. Turn it off with `"nudge_on_stop": false` under
+  save its decisions, rules or results before it stops. In a git
+  repository, edits made with shell commands count too: the hook compares
+  the working tree (as `git status` sees it) with where it stood when the
+  turn began, and counts the change only when the turn ran an edit or shell
+  tool, so your own edits in an editor are not blamed on the agent. Each
+  set of changes is asked about once. Outside git, only the editing tools
+  count. This costs one extra round trip on such turns. Turn it off with `"nudge_on_stop": false` under
   `brief` in `harness.json`; `"save_unrecorded_on_compact": false` turns off
   the other.
 
@@ -98,16 +105,20 @@ The config is read in three layers:
    the built-in one (`mem-harness print-config` prints it). Only this layer
    may name commands: `backends`, `stores` and `brief_sections`.
 2. **The project's:** `<project>/.mem-harness/harness.json`, laid over yours.
-   Claude Code may open any repository, so this file may set only `profile`,
-   `profiles`, `brief`, `main_agent`, `routes` and `ownership`. Anything else
-   is refused with an error.
+   Claude Code may open any repository, so this file may only pick one of
+   your profiles (`profile`), change `brief` settings, and set `main_agent`.
+   Anything else is refused with an error, because it could run commands,
+   hide tools, or put text in the instructions the model reads.
 3. **`MEM_HARNESS_PROFILE`** picks the profile. `lean` is the default, and
    `full` shows every tool that is not a duplicate.
 
 The ownership table decides which tool owns a feature, and each backend's
-`*_DISABLE` variable is computed from it. A trim that cannot take effect is
-an error: for example a trim on a backend with no `disable_env`, or one that
-would hide a feature from its owner.
+`*_DISABLE` variable is computed from it. Each entry's `protect` list names
+the owner's groups and tools that serve the feature. A trim that cannot take
+effect, or would hide one of those, is an error: for example a trim on a
+backend with no `disable_env`, or `locks` on the hub. A trim is one group or
+tool name (letters, digits, `_`, `-`). Unknown keys are errors at every
+level, so a typo such as `env_passs` cannot silently turn a setting off.
 
 ### Adding a tool or a third-party MCP server
 
@@ -126,6 +137,7 @@ Its tools appear as `docs_<tool>`. The optional settings:
 | `handshake_s` | how long to wait for it to start (default 20) |
 | `call_s` | the cap on one call (default 3600) |
 | `env_pass` | gives it only the basic system variables plus these, instead of your whole environment. Use it for servers you did not write. |
+| `keep_children` | leave processes the server started running when it stops (normally its whole process group is stopped with it) |
 | `hide_tools` / `only_tools` | the proxy hides tools itself, so this works for servers that have no `*_DISABLE` variable. A pattern matches the server's own tool name, or that name after `strip_prefix`. `*` is a wildcard. |
 
 A remote server works through a stdio bridge such as `mcp-remote`. The

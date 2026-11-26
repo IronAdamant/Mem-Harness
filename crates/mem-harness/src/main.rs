@@ -13,17 +13,20 @@ mem-harness: one MCP server and one set of hooks for the suite tools
 
 Usage:
   mem-harness mcp                       serve MCP on stdio (what Claude Code starts)
-  mem-harness hook <event>              run a Claude Code hook; event: session-start | subagent-start |
-                                        pre-compact | post-compact | stop | subagent-stop
+  mem-harness hook <event>              run a Claude Code hook; event: session-start | prompt-submit |
+                                        subagent-start | pre-compact | post-compact | stop |
+                                        subagent-stop
   mem-harness brief [--agent NAME]      print the merged compaction brief
   mem-harness init                      create the Relatum, Libellus and Adsertio stores here if missing
   mem-harness ownership                 print who owns each feature and what is hidden where
   mem-harness doctor                    check config, project and every backend's binary
   mem-harness install                   print the user-wide MCP entry and hook settings to paste
-  mem-harness print-config              print the built-in harness.json (copy to .mem-harness/harness.json to edit)
+  mem-harness print-config              print the built-in harness.json (copy to ~/.mem-harness/harness.json to edit)
   mem-harness --version
 
-Environment: MEM_HARNESS_CONFIG (config file), MEM_HARNESS_PROJECT (project root).";
+Config: $MEM_HARNESS_CONFIG (an absolute path) or ~/.mem-harness/harness.json, else built in.
+A project's .mem-harness/harness.json may set only: profile, brief, main_agent.
+Environment: MEM_HARNESS_CONFIG, MEM_HARNESS_PROFILE (profile), MEM_HARNESS_PROJECT (project root).";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -337,6 +340,7 @@ const HOOKS: &[(&str, Option<&str>, &str)] = &[
         Some("startup|resume|clear|compact"),
         "session-start",
     ),
+    ("UserPromptSubmit", None, "prompt-submit"),
     ("SubagentStart", None, "subagent-start"),
     ("PreCompact", None, "pre-compact"),
     ("PostCompact", None, "post-compact"),

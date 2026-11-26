@@ -4,10 +4,15 @@
 //! that starts a background process can exit while that process still holds
 //! its stdout or stderr open; the reads would then wait for the background
 //! process. So the reads are abandoned at the deadline too, and on Unix the
-//! child runs in its own process group, which is killed (`kill -TERM`,
-//! then `-KILL` for anything that ignores it; std only) on timeout or when
-//! the reads outlast the deadline.
-//! On Windows only the child itself is killed.
+//! child runs in its own process group, which is killed (TERM, then KILL
+//! for anything that ignores it) on timeout or when
+//! the reads outlast the deadline. Its descendants are listed before the
+//! kill, so one that left the group (`setsid`) is signalled by pid too; on
+//! Linux the hook process is a subreaper ([`adopt_orphans`]), so a process
+//! that double-forked out of the tree is found as well. Signals go through
+//! `mh_sys` (no `kill` binary needed). On macOS a process that double-forks
+//! and whose middle process exits before the timeout is re-parented to
+//! launchd and not found. On Windows only the child itself is killed.
 
 use std::io::Read;
 use std::path::Path;
@@ -92,44 +97,81 @@ fn own_group(cmd: &mut Command) {
 #[cfg(not(unix))]
 fn own_group(_cmd: &mut Command) {}
 
+/// The pids of the children `run_command` is running now. Spawning and
+/// every `ps` read in [`stragglers`] hold this lock, so a child being
+/// started, or another thread's `ps`, is never mistaken for an orphan.
+static RUNNING: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Set once [`adopt_orphans`] made this process a subreaper.
+static SUBREAPER: AtomicBool = AtomicBool::new(false);
+
+/// Linux: make this process the reaper of the orphans its commands leave,
+/// so a process that double-forks out of a hook command's tree is
+/// re-parented here (where a timeout can find it) instead of to init. Call
+/// it only in a short-lived process (the hook process): orphans that exit
+/// stay zombies until this process exits. A no-op elsewhere; idempotent.
+pub fn adopt_orphans() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if mh_sys::become_subreaper() {
+            SUBREAPER.store(true, Ordering::SeqCst);
+        }
+    });
+}
+
 /// Stop the child's process group (its id is the child's pid), which also
-/// reaches any background process it started: TERM first, then KILL after
-/// [`TERM_GRACE`] for anything that ignored it. This only runs on the
-/// timeout path, so the short wait costs nothing in a normal run.
-#[cfg(unix)]
-fn kill_group(pid: u32) {
-    let kill = ["/bin/kill", "/usr/bin/kill"]
-        .into_iter()
-        .find(|p| Path::new(p).is_file())
-        .unwrap_or("kill");
-    let signal = |sig: &str| {
-        Command::new(kill)
-            .arg(sig)
-            .arg("--")
-            .arg(format!("-{pid}"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+/// reaches any background process it started, and each of `others`
+/// (descendants that left the group, listed before anything was
+/// signalled): TERM first, then KILL after [`TERM_GRACE`] for anything
+/// that ignored it. This only runs on the timeout path, so the short wait
+/// costs nothing in a normal run. Uses `mh_sys`, so it needs no `kill`
+/// binary; a no-op where there are no signals (Windows).
+fn kill_group(pid: u32, others: &[u32]) {
+    let send = |sig: i32| {
+        let mut any = mh_sys::signal_group(pid, sig);
+        for &p in others {
+            any |= mh_sys::signal(p, sig);
+        }
+        any
     };
-    // `kill` fails once no process is left in the group.
-    if signal("-TERM") {
+    // Signalling fails once no process is left.
+    if send(mh_sys::SIGTERM) {
         std::thread::sleep(TERM_GRACE);
-        signal("-KILL");
+        send(mh_sys::SIGKILL);
     }
 }
 
 /// How long a process group gets to exit on TERM before it is sent KILL.
-#[cfg(unix)]
 const TERM_GRACE: Duration = Duration::from_millis(200);
 
-#[cfg(not(unix))]
-fn kill_group(_pid: u32) {}
+/// What else to stop with a child: its descendants (`child` still
+/// running; read before any signal, so one that called `setsid` is found)
+/// and, when this process is a subreaper ([`adopt_orphans`]), the orphans
+/// re-parented to us: our descendants outside every running command's tree.
+/// Unix only: `ps` is read.
+fn stragglers(child: Option<u32>) -> Vec<u32> {
+    if !cfg!(unix) {
+        return Vec::new();
+    }
+    let running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut v = child.map(mh_sys::descendants).unwrap_or_default();
+    if SUBREAPER.load(Ordering::SeqCst) {
+        let mut owned: Vec<u32> = running.clone();
+        for &r in running.iter() {
+            owned.extend(mh_sys::descendants(r));
+        }
+        for p in mh_sys::descendants(std::process::id()) {
+            if !owned.contains(&p) && !v.contains(&p) {
+                v.push(p);
+            }
+        }
+    }
+    v
+}
 
 fn kill_tree(child: &mut Child) {
-    kill_group(child.id());
+    let others = stragglers(Some(child.id()));
+    kill_group(child.id(), &others);
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -154,9 +196,24 @@ pub fn run_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     own_group(&mut cmd);
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("cannot start {program}: {e}"))?;
+    let mut child = {
+        let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+        let child = cmd
+            .spawn()
+            .map_err(|e| format!("cannot start {program}: {e}"))?;
+        running.push(child.id());
+        child
+    };
+    let result = finish(program, &mut child, timeout);
+    RUNNING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|p| *p != child.id());
+    result
+}
+
+/// Wait for a started child under the deadline; see [`run_command`].
+fn finish(program: &str, child: &mut Child, timeout: Duration) -> Result<CmdOut, String> {
     let out = Drain::spawn(child.stdout.take());
     let err = Drain::spawn(child.stderr.take());
     let deadline = Instant::now() + timeout;
@@ -164,12 +221,12 @@ pub fn run_command(
         match child.try_wait() {
             Ok(Some(s)) => break s,
             Ok(None) if Instant::now() >= deadline => {
-                kill_tree(&mut child);
+                kill_tree(child);
                 return Err(format!("{program} timed out after {}s", timeout.as_secs()));
             }
             Ok(None) => std::thread::sleep(POLL),
             Err(e) => {
-                kill_tree(&mut child);
+                kill_tree(child);
                 return Err(format!("cannot wait for {program}: {e}"));
             }
         }
@@ -177,7 +234,9 @@ pub fn run_command(
     if !wait_drains(&out, &err, deadline) {
         // Something the child started still holds the pipes. Stop it and
         // keep what was read; the reader threads end when the pipes close.
-        kill_group(child.id());
+        // The child is gone, so only orphans adopted on Linux can be
+        // found outside its group.
+        kill_group(child.id(), &stragglers(None));
         wait_drains(&out, &err, Instant::now() + GRACE);
     }
     Ok(CmdOut {
@@ -273,6 +332,38 @@ mod tests {
         assert!(
             !marker.exists(),
             "a process that ignored TERM outlived the kill"
+        );
+    }
+
+    /// A descendant that left the process group (`setsid`) is found before
+    /// the kill and stopped by pid.
+    #[test]
+    fn a_process_that_left_the_group_is_killed() {
+        let Some(perl) = ["/usr/bin/perl", "/bin/perl"]
+            .into_iter()
+            .find(|p| Path::new(p).is_file())
+        else {
+            return;
+        };
+        let cwd = std::env::temp_dir();
+        let marker = cwd.join(format!("mh-run-setsid-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!(
+            "{perl} -MPOSIX -e 'POSIX::setsid(); sleep 2; open(F, \">\", \"{}\")' & sleep 30",
+            marker.display()
+        );
+        let e = run_command(
+            "/bin/sh",
+            &["-c", &script],
+            &cwd,
+            Duration::from_millis(500),
+        )
+        .unwrap_err();
+        assert!(e.contains("timed out"), "{e}");
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(
+            !marker.exists(),
+            "a process in its own session outlived the kill"
         );
     }
 }

@@ -48,7 +48,7 @@ pub fn find_command(cmd: &str, base: &Path) -> Option<PathBuf> {
     let p = Path::new(cmd);
     if p.components().count() > 1 {
         let full = base.join(p);
-        return candidates(&full).into_iter().find(|c| c.is_file());
+        return candidates(&full).into_iter().find(|c| runnable(c));
     }
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
@@ -59,7 +59,21 @@ pub fn find_command(cmd: &str, base: &Path) -> Option<PathBuf> {
     dirs.iter()
         .filter(|d| d.is_absolute())
         .flat_map(|d| candidates(&d.join(cmd)))
-        .find(|c| c.is_file())
+        .find(|c| runnable(c))
+}
+
+/// A file the OS would start: on Unix it needs an execute bit, so a
+/// non-executable file earlier on `PATH` is skipped, as `execvp` does.
+fn runnable(p: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        p.is_file()
+    }
 }
 
 /// The files `path` may mean: on Windows `path` plus each `PATHEXT`
@@ -91,6 +105,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mh-core-find-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         std::fs::write(dir.join("bin").join("tool"), "x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let t = dir.join("bin").join("tool");
+            std::fs::set_permissions(&t, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(dir.join("bin").join("plain"), "x").unwrap();
+            assert_eq!(find_command("bin/plain", &dir), None, "not executable");
+        }
         assert_eq!(
             find_command("bin/tool", &dir),
             Some(dir.join("bin").join("tool"))

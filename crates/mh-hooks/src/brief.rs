@@ -41,6 +41,15 @@ impl Section {
     }
 }
 
+impl Section {
+    /// The least room that still shows the section: its first line and the
+    /// trim marker (what [`trim`] needs to keep both).
+    fn floor(&self) -> usize {
+        let first = self.lines.first().map_or(0, |l| l.chars().count() + 1);
+        first + marker(&self.tool).chars().count() + 3
+    }
+}
+
 fn marker(tool: &str) -> String {
     format!("- (trimmed; call {tool} for the rest)")
 }
@@ -68,9 +77,30 @@ fn trim(sec: &Section, alloc: usize) -> Option<Vec<String>> {
     Some(kept)
 }
 
+/// Split `avail` among sections: first each gets its `floors` entry (room
+/// for its first line and trim marker, so no section vanishes unannounced)
+/// when all floors fit; the rest goes by weight.
+fn allocate(needs: &[usize], weights: &[usize], floors: &[usize], avail: usize) -> Vec<usize> {
+    let floors: Vec<usize> = needs
+        .iter()
+        .zip(floors)
+        .map(|(n, f)| (*n).min(*f))
+        .collect();
+    let total: usize = floors.iter().sum();
+    if total == 0 || total > avail {
+        return by_weight(needs, weights, avail);
+    }
+    let rest: Vec<usize> = needs.iter().zip(&floors).map(|(n, f)| n - f).collect();
+    by_weight(&rest, weights, avail - total)
+        .into_iter()
+        .zip(floors)
+        .map(|(a, f)| a + f)
+        .collect()
+}
+
 /// Split `avail` among sections by weight; a section that needs less than
 /// its share frees the rest for the others.
-fn allocate(needs: &[usize], weights: &[usize], avail: usize) -> Vec<usize> {
+fn by_weight(needs: &[usize], weights: &[usize], avail: usize) -> Vec<usize> {
     let mut alloc = vec![0; needs.len()];
     let mut done: Vec<bool> = needs.iter().map(|n| *n == 0).collect();
     let mut remaining = avail;
@@ -112,7 +142,8 @@ pub fn assemble(agent: &str, sections: &[Section], budget: usize) -> String {
     let fixed = header.chars().count() + 2 + FOOTER.chars().count();
     let needs: Vec<usize> = sections.iter().map(|s| s.chars()).collect();
     let weights: Vec<usize> = sections.iter().map(|s| s.weight).collect();
-    let alloc = allocate(&needs, &weights, budget.saturating_sub(fixed));
+    let floors: Vec<usize> = sections.iter().map(|s| s.floor()).collect();
+    let alloc = allocate(&needs, &weights, &floors, budget.saturating_sub(fixed));
     let mut out = header;
     for (s, a) in sections.iter().zip(alloc) {
         if let Some(lines) = trim(s, a) {
@@ -255,9 +286,34 @@ pub fn claims_lines(label: &str, res: Result<CmdOut, String>) -> Option<Vec<Stri
     Some(lines)
 }
 
-/// Lines from a command whose stdout is shown as is under `heading`
-/// (`chisel issues --brief` is one). Empty output is no section; a failure
-/// is one `- <label>: <reason>` line.
+/// One line of a command's stdout made safe to show inside the brief:
+/// control characters are dropped (a tab becomes a space), and a line that
+/// would start with `#` gets its hashes put in brackets (`## x` becomes
+/// `[##] x`), so the output cannot open a heading of its own and pass as
+/// the harness's structure (a forged rules section or a second brief).
+pub fn neutralise(line: &str) -> String {
+    let clean: String = line
+        .chars()
+        .filter_map(|c| match c {
+            '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect();
+    let body = clean.trim_start();
+    let hashes = body.chars().take_while(|c| *c == '#').count();
+    if hashes == 0 {
+        return clean;
+    }
+    let indent = &clean[..clean.len() - body.len()];
+    format!("{indent}[{}]{}", &body[..hashes], &body[hashes..])
+}
+
+/// Lines from a command whose stdout is shown under `heading`
+/// (`chisel issues --brief` is one), each passed through [`neutralise`]:
+/// the output is a third party's text, and only the harness writes
+/// headings. Empty output is no section; a failure is one
+/// `- <label>: <reason>` line.
 pub fn text_section_lines(
     label: &str,
     heading: &str,
@@ -269,7 +325,7 @@ pub fn text_section_lines(
         Ok(o) if o.stdout.trim().is_empty() => None,
         Ok(o) => {
             let mut lines = vec![heading.to_string()];
-            lines.extend(text_lines(&o.stdout));
+            lines.extend(text_lines(&o.stdout).iter().map(|l| neutralise(l)));
             Some(lines)
         }
     }
@@ -305,9 +361,10 @@ fn run_section(
         return None;
     }
     if spec.parse == "relatum-rules" {
-        // The Relatum store from config when listed there, else its default.
+        // The Relatum store from config when listed there, else its
+        // default; found with the same lookup as the Setup section.
         let store = match cfg_store(stores, "relatum") {
-            Some(st) => mh_adapters::relatum::store_dir_in(project, &st.dir, &st.env)?,
+            Some(st) => crate::stores::locate(project, st).ok().flatten()?,
             None => mh_adapters::relatum::store_dir(project)?,
         };
         return rules_lines(Some(mh_adapters::relatum::active_rules(&store)));
@@ -377,7 +434,7 @@ pub fn compose_brief_with(cfg: &Config, project: &Path, agent: &str, run: &Runne
                 let lines = h
                     .join()
                     .unwrap_or_else(|_| Some(vec![format!("- {}: section panicked", spec.name)]))?;
-                Some(Section::new(spec.weight, &spec.name, lines))
+                Some(Section::new(spec.weight, &spec.tool, lines))
             })
             .collect()
     });
@@ -680,6 +737,7 @@ mod tests {
             weight: 7,
             heading: format!("## {name} heading"),
             only_if_exists: gate.into(),
+            tool: name.into(),
         };
         cfg.brief_sections = vec![
             spec("todo", "todo-cli", ""),

@@ -46,7 +46,7 @@
     { "name": "relatum_ls", "parse": "relatum-rules", "weight": 20 },
     { "name": "adsertio_view", "parse": "adsertio-claims", "command": "adsertio",
       "args": ["view", "--compact", "--states", "unverified", "--states", "refuted", "--limit", "50", "--if-store"], "weight": 20 },
-    { "name": "issues", "parse": "chisel-issues", "command": "chisel", "args": ["issues", "--brief"], "weight": 10, "only_if_exists": ".chisel" }
+    { "name": "issues", "parse": "chisel-issues", "command": "chisel", "args": ["issues", "--brief"], "weight": 10, "only_if_exists": ".chisel", "tool": "chisel_issues" }
   ],
   "backends": [
     {
@@ -159,18 +159,21 @@
   "ownership": [
     {
       "feature": "locks",
+      "protect": ["locks", "acquire_lock", "release_lock", "list_locks", "who"],
       "owner": "hub",
       "why": "four tools lock files; one lock table avoids two agents each holding a different tool's lock on one file",
       "disable": { "chisel": ["locks"], "stele": ["locks"], "trammel": ["locks"] }
     },
     {
       "feature": "messages",
+      "protect": ["messages", "send_message", "manage_messages", "broadcast"],
       "owner": "hub",
       "why": "one channel for agent messages, broadcasts and handoffs",
       "disable": { "stele": ["messages"] }
     },
     {
       "feature": "task-board",
+      "protect": ["board"],
       "owner": "libellus",
       "why": "the board feeds the compaction brief and closes finished work itself (decision 2026-11-26)",
       "disable": { "hub": ["tasks"] }
@@ -183,30 +186,35 @@
     },
     {
       "feature": "rules",
+      "protect": ["revise", "new", "edit", "supersede", "get", "ls"],
       "owner": "relatum",
       "why": "constraints and conventions are Relatum notes only, passed to sub-agents by id (decision 2026-11-26)",
       "disable": { "trammel": ["add_constraint", "get_constraints", "deactivate_constraint"] }
     },
     {
       "feature": "private-notes",
+      "protect": ["note", "get", "ls", "resolve"],
       "owner": "libellus",
       "why": "per-agent questions, decisions and dead ends that must survive compaction",
       "disable": { "stele": ["notes", "kv"] }
     },
     {
       "feature": "shared-notes",
+      "protect": ["new", "get", "ls"],
       "owner": "relatum",
       "why": "facts several agents read; Libellus promotes into it",
       "disable": {}
     },
     {
       "feature": "file-change-journal",
+      "protect": ["record_change", "record_changes", "why_file", "journal", "search_journal"],
       "owner": "wikifier",
       "why": "why each file changed, kept beside the import map",
       "disable": {}
     },
     {
       "feature": "plan-handoff-notes",
+      "protect": ["add_note", "resume"],
       "owner": "trammel",
       "why": "notes scoped to one plan, read by resume",
       "disable": {}
