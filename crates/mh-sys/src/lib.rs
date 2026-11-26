@@ -121,12 +121,19 @@ fn process_table() -> Vec<(u32, u32)> {
         .into_iter()
         .find(|p| std::path::Path::new(p).is_file())
         .unwrap_or("ps");
-    let Ok(out) = std::process::Command::new(ps)
+    let Ok(child) = std::process::Command::new(ps)
         .args(["-A", "-o", "pid=,ppid="])
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
+        .spawn()
     else {
+        return Vec::new();
+    };
+    // `ps` lists itself as our child; leave it out, or a caller would
+    // signal a pid that is gone by then (and may have been reused).
+    let own = child.id();
+    let Ok(out) = child.wait_with_output() else {
         return Vec::new();
     };
     String::from_utf8_lossy(&out.stdout)
@@ -135,6 +142,7 @@ fn process_table() -> Vec<(u32, u32)> {
             let mut it = l.split_whitespace();
             Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
         })
+        .filter(|&(pid, _)| pid != own)
         .collect()
 }
 
@@ -182,6 +190,13 @@ mod tests {
         let grandchild: u32 = line.trim().parse().unwrap();
         assert!(alive(grandchild));
         assert!(descendants(child.id()).contains(&grandchild));
+        // The listing's own `ps` is never reported as our descendant.
+        let ours = descendants(std::process::id());
+        assert!(ours.contains(&child.id()) && ours.contains(&grandchild));
+        assert!(
+            ours.iter().all(|&p| alive(p)),
+            "a reported pid is gone: {ours:?}"
+        );
         assert!(signal_group(child.id(), SIGKILL));
         let _ = child.wait();
         assert!(wait_gone(grandchild), "grandchild survived the group kill");
