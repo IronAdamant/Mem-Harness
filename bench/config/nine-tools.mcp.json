@@ -1,0 +1,70 @@
+{
+ "mcpServers": {
+  "wikifier": {
+   "type": "stdio",
+   "command": "~/.cargo/bin/wikifier",
+   "args": [
+    "mcp"
+   ],
+   "env": {}
+  },
+  "probatio": {
+   "type": "stdio",
+   "command": "~/.cargo/bin/probatio",
+   "args": [
+    "mcp"
+   ],
+   "env": {}
+  },
+  "stele-context": {
+   "type": "stdio",
+   "command": "~/.cargo/bin/stele-context",
+   "args": [
+    "serve-mcp"
+   ],
+   "env": {}
+  },
+  "trammel": {
+   "type": "stdio",
+   "command": "~/.cargo/bin/trammel",
+   "args": [
+    "mcp"
+   ],
+   "env": {}
+  },
+  "relatum": {
+   "type": "stdio",
+   "command": "~/.cargo/bin/relatum-mcp",
+   "args": [],
+   "env": {}
+  },
+  "chisel": {
+   "type": "stdio",
+   "command": "~/.cargo/bin/chisel",
+   "args": [
+    "serve-mcp"
+   ],
+   "env": {}
+  },
+  "coordinationhub": {
+   "type": "stdio",
+   "command": "~/.cargo/bin/coordinationhub",
+   "args": [
+    "serve-mcp"
+   ],
+   "env": {}
+  },
+  "adsertio": {
+   "type": "stdio",
+   "command": "~/.cargo/bin/adsertio-mcp",
+   "args": [],
+   "env": {}
+  },
+  "libellus": {
+   "type": "stdio",
+   "command": "~/.cargo/bin/libellus-mcp",
+   "args": [],
+   "env": {}
+  }
+ }
+}

@@ -1,0 +1,12 @@
+{
+ "mcpServers": {
+  "mem-harness": {
+   "type": "stdio",
+   "command": "~/.cargo/bin/mem-harness",
+   "args": [
+    "mcp"
+   ],
+   "env": {}
+  }
+ }
+}

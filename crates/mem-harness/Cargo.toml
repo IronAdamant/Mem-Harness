@@ -9,8 +9,6 @@ repository.workspace = true
 [dependencies]
 mh-json = { path = "../mh-json" }
 mh-core = { path = "../mh-core" }
-mh-backend = { path = "../mh-backend" }
-mh-adapters = { path = "../mh-adapters" }
 mh-hooks = { path = "../mh-hooks" }
 mh-proxy = { path = "../mh-proxy" }
 [[bin]]

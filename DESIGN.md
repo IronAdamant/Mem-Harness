@@ -25,7 +25,7 @@ memories that survive compaction.
 | `mh-adapters` | native readers of tool stores; `relatum` notes and the `relatum:` evidence pointer |
 | `mh-hooks` | Claude Code hook handling and the merged compaction brief |
 | `mh-proxy` | the MCP server Claude Code talks to; fronts every backend plus native tools |
-| `mem-harness` | the binary: `mcp`, `hook`, `brief`, `ownership`, `doctor`, `print-config` |
+| `mem-harness` | the binary: `mcp`, `hook`, `brief`, `init`, `ownership`, `doctor`, `install`, `print-config` |
 
 ## Ownership (decided 2026-11-26)
 
@@ -79,8 +79,27 @@ pub fn active_rules(store: &Path) -> Result<Vec<Note>, String>; // kind constrai
 
 // mh-hooks
 pub fn compose_brief(cfg: &Config, project: &Path, agent: &str) -> String;
-pub fn run_hook(cfg: &Config, project: &Path, event: &str, stdin: &str) -> Result<String, String>; // stdout JSON line
+pub fn run_hook(cfg: &Config, project: &Path, event: &str, stdin: &str) -> Result<String, String>; // the hook's stdout
 ```
+
+## Hooks
+
+A hook is a program, not the model, so it cannot write down what only the
+model knows. Each event does what a hook can do (`mh_hooks::memory`):
+
+| Event | `mem-harness hook` | Does |
+|---|---|---|
+| SessionStart (startup, resume, clear, compact) | `session-start` | injects the brief |
+| SubagentStart | `subagent-start` | injects the sub-agent's name and its brief |
+| PreCompact | `pre-compact` | prints instructions for the summary: end with `## Not yet recorded`, one `- <kind>: ...` line per unsaved decision, dead end, question or result |
+| PostCompact | `post-compact` | saves those lines as Libellus notes for `main`, tagged `from-compact` (`brief.save_unrecorded_on_compact`) |
+| Stop, SubagentStop | `stop`, `subagent-stop` | when the turn edited files and called no save tool, blocks once and asks the agent to save; `stop_hook_active` lets it stop the second time (`brief.nudge_on_stop`) |
+
+The stop check reads the last 8 MB of the transcript and looks at the turn
+after the last prompt. Edit tools are `Edit`, `Write`, `MultiEdit` and
+`NotebookEdit`; shell edits are not seen. A project with none of the three
+stores is never nudged. SessionEnd is not used: it cannot reach the model
+and has 1.5 seconds.
 
 ## Claims about rules
 

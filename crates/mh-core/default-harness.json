@@ -29,7 +29,9 @@
   },
   "brief": {
     "budget_chars": 8000,
-    "command_timeout_s": 10
+    "command_timeout_s": 10,
+    "nudge_on_stop": true,
+    "save_unrecorded_on_compact": true
   },
   "backends": [
     {
