@@ -1,1 +1,14 @@
 target/
+
+# Stores the suite tools write when the harness runs in this repository
+.adsertio/
+.chisel/
+.coordinationhub/
+.libellus/
+.mem-harness/
+.probatio/
+.stele-context/
+.swarmnotes/
+.trammel/
+.wikifier/
+.wikifier_staging/

@@ -6,7 +6,7 @@ Chisel, Trammel and Relatum. Each shared feature has one owner, so there are
 no duplicate tools. Rules, claims, notes and the task board come back as one
 brief at session start, after compaction, and for every sub-agent.
 
-Zero dependencies (std only). Design and contracts: [DESIGN.md](DESIGN.md).
+Zero dependencies (std only). MIT licensed. Design and contracts: [DESIGN.md](DESIGN.md).
 
 ## Install
 
@@ -14,6 +14,7 @@ The nine tools must be on `PATH` or in `~/.cargo/bin`. Adsertio must be
 1.5.0 or later (Relatum evidence).
 
 ```sh
+git clone https://github.com/IronAdamant/Mem-Harness && cd Mem-Harness
 cargo install --path crates/mem-harness --locked   # -> ~/.cargo/bin/mem-harness
 mem-harness doctor                                 # every backend binary found?
 mem-harness install                                # prints the config below
