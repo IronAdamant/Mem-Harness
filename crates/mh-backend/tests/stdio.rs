@@ -399,6 +399,11 @@ fn server_requests_are_answered() {
     );
 }
 
+/// Unix prints `exit status: N`, Windows `exit code: N`.
+fn exited_with(e: &str, code: i32) -> bool {
+    e.contains(&format!("exit status: {code}")) || e.contains(&format!("exit code: {code}"))
+}
+
 #[test]
 fn crash_fails_the_call_with_stderr_and_the_next_call_respawns() {
     let f = fixture("crash", &[], quick());
@@ -409,7 +414,7 @@ fn crash_fails_the_call_with_stderr_and_the_next_call_respawns() {
             .unwrap_err(),
     );
     assert!(e.contains("fake: crashing now"), "{e}");
-    assert!(e.contains("exit status: 3"), "{e}");
+    assert!(exited_with(&e, 3), "{e}");
     let st = f.backend.status();
     assert!(!st.up);
     assert_eq!(st.error.as_deref(), Some(e.as_str()));
@@ -446,7 +451,7 @@ fn startup_exit_reports_the_stderr_line() {
     let f = fixture("startexit", &[("FAKE_STARTUP_EXIT", msg)], quick());
     let e = unavailable(f.backend.start().unwrap_err());
     assert!(e.contains(msg), "{e}");
-    assert!(e.contains("exit status: 2"), "{e}");
+    assert!(exited_with(&e, 2), "{e}");
     assert!(
         e.contains("mh-fake-mcp serve") || e.contains("serve"),
         "{e}"
