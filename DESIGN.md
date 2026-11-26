@@ -7,7 +7,10 @@ memories that survive compaction.
 ## Rules for all code here
 
 - **Zero dependencies.** Every crate's `[dependencies]` holds only path deps on
-  sibling crates in this workspace. No crates.io. std only.
+  sibling crates in this workspace. No crates.io. std only, except the few
+  OS calls std lacks (signal a process group, Linux subreaper), declared by
+  hand in `mh-sys` against the C library std already links. No other crate
+  uses `unsafe`.
 - Rust 1.83+, edition 2021. `cargo fmt`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test` must pass.
 - JSON goes through `mh-json` (`Value`, `parse`, `to_json`). Numbers keep their
@@ -25,6 +28,7 @@ memories that survive compaction.
 | `mh-adapters` | native readers of tool stores; `relatum` notes and the `relatum:` evidence pointer |
 | `mh-hooks` | Claude Code hook handling and the merged compaction brief |
 | `mh-proxy` | the MCP server Claude Code talks to; fronts every backend plus native tools |
+| `mh-sys` | the only OS calls: `signal_group`, `signal`, `become_subreaper` (Linux), `descendants` |
 | `mem-harness` | the binary: `mcp`, `hook`, `brief`, `init`, `ownership`, `doctor`, `install`, `print-config` |
 
 ## Ownership (decided 2026-11-26)
@@ -54,10 +58,12 @@ for every tool.
 ## Config layers and extension points
 
 `Config::load` reads three layers. The user's own file
-(`$MEM_HARNESS_CONFIG`, else `~/.mem-harness/harness.json`, else the built-in
-one) is the only layer that may name commands. The project's
-`.mem-harness/harness.json` is an overlay limited to `PROJECT_KEYS`, because
-Claude Code may open any repository. `$MEM_HARNESS_PROFILE` is applied last.
+(`$MEM_HARNESS_CONFIG`, which must be absolute, else
+`~/.mem-harness/harness.json`, else the built-in one) is the only layer that
+may name commands, hide tools or write text the model reads. The project's
+`.mem-harness/harness.json` is an overlay limited to `PROJECT_KEYS`
+(`profile`, `brief`, `main_agent`), because Claude Code may open any
+repository. `$MEM_HARNESS_PROFILE` is applied last.
 Every problem is an `Err`, never a panic.
 
 Adding things without code:

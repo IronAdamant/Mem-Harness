@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+Fixes from a second adversarial review (30 confirmed, 15 plausible findings), and the known limits, except Windows-specific work.
+
+**Security**
+- A project's `.mem-harness/harness.json` may now set only `profile` (one of yours), `brief` and `main_agent`. `profiles`, `ownership` and `routes` moved to your own config, because a repository could otherwise:
+  - hide a feature's owner by replacing the ownership table or defining its own trims;
+  - put its own text into the instructions the model reads.
+- A trim is one name (`[A-Za-z0-9_-]`). A comma or a NUL character used to get past the owner and `core` checks.
+- Each ownership entry lists the owner's protected groups and tools (`protect`). Before, the check only worked when a feature's name equalled a group name.
+- Unknown keys are errors inside every object, not only at the top level, so a typo cannot silently turn off `env_pass`.
+- `MEM_HARNESS_CONFIG` must be an absolute path. A relative one would have been read from the repository.
+- Command lookup skips files without an execute bit, as the shell does.
+
 ## 0.3.0
 
 Fixes from a full adversarial review (32 findings, 28 reproduced with failing tests), and room for new tools.

@@ -680,6 +680,7 @@ mod tests {
             weight: 7,
             heading: format!("## {name} heading"),
             only_if_exists: gate.into(),
+            tool: name.into(),
         };
         cfg.brief_sections = vec![
             spec("todo", "todo-cli", ""),
