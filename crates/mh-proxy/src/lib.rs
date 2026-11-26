@@ -4,13 +4,16 @@
 //! Protocol: MCP over stdio, newline-delimited JSON-RPC 2.0. Input is read
 //! on the calling thread; every tool call runs on its own thread, so a slow
 //! call never blocks another. All output goes through one mutex, one
-//! message per line, flushed after each. No batches; lines over
-//! [`MAX_LINE`] bytes are answered -32700 and skipped.
+//! message per line, flushed after each. No batches; lines whose content
+//! (without the `\n` or `\r\n`) is over [`MAX_LINE`] bytes are answered
+//! -32700 and skipped. Backends' `notifications/message` are relayed, so the
+//! server declares `logging`; `logging/setLevel` filters what is relayed.
 //!
 //! A backend whose start or `tools/list` failed is fetched again: by a
 //! timer with backoff, by a later `tools/list`, and by a call to a name
 //! under its prefix; when its tools appear the client gets
-//! `notifications/tools/list_changed`. A backend's `hide_tools` and
+//! `notifications/tools/list_changed`. Concurrent calls under one failed
+//! backend share one start. A backend's `hide_tools` and
 //! `only_tools` are applied here, whatever the backend itself honours.
 
 mod catalog;
@@ -78,7 +81,42 @@ pub fn serve_with<R: BufRead, W: Write + Send + 'static>(
     input: R,
     output: W,
 ) -> Result<(), String> {
-    server::run(cfg, natives, make_backends, input, output)
+    serve_with_options(
+        cfg,
+        natives,
+        make_backends,
+        input,
+        output,
+        Options::default(),
+    )
+}
+
+/// Knobs for [`serve_with_options`]; the default is what [`serve`] uses.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Options {
+    /// Retry failed backends on a timer with backoff (default true). Off,
+    /// only a `tools/list` or a call under a backend's prefix starts a
+    /// failed backend again; tests use this to be deterministic.
+    pub retry_timer: bool,
+}
+
+impl Default for Options {
+    fn default() -> Options {
+        Options { retry_timer: true }
+    }
+}
+
+/// [`serve_with`] with [`Options`].
+pub fn serve_with_options<R: BufRead, W: Write + Send + 'static>(
+    cfg: Config,
+    natives: Vec<NativeTool>,
+    make_backends: impl FnOnce(EventSink) -> Vec<Arc<dyn Backend>>,
+    input: R,
+    output: W,
+    opts: Options,
+) -> Result<(), String> {
+    server::run(cfg, natives, make_backends, input, output, opts)
 }
 
 /// Stands in for a backend that could not even be built, so the failure
