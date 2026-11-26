@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 
 static DIRS: AtomicUsize = AtomicUsize::new(0);
 
-/// Reply to `initialize` (id 1) and read `notifications/initialized`.
-const HANDSHAKE: &str = r#"read l; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read l; "#;
+/// Reply to `initialize` with the id it carries (a restarted server gets a
+/// new one) and read `notifications/initialized`.
+const HANDSHAKE: &str = r#"read l; id=$(printf '%s' "$l" | sed 's/.*"id":\([0-9]*\).*/\1/'); printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"; read l; "#;
 
 fn sh(tag: &str, script: &str, limits: Limits) -> StdioBackend {
     let n = DIRS.fetch_add(1, Ordering::SeqCst);
@@ -136,13 +137,19 @@ fn a_call_in_the_exit_window_matches_the_status() {
     let st = b.status();
     let _ = first.join();
     match &r {
-        Err(CallError::Unavailable(e)) => assert_eq!(
-            st.error.as_deref(),
-            Some(e.as_str()),
-            "caller saw {e:?}, status (up = {}) says {:?}",
-            st.up,
-            st.error
-        ),
+        Err(CallError::Unavailable(e)) => {
+            assert_eq!(
+                st.error.as_deref(),
+                Some(e.as_str()),
+                "caller saw {e:?}, status (up = {}) says {:?}",
+                st.up,
+                st.error
+            );
+            // The restarted server finished its handshake, got the call and
+            // exited on it: not a handshake timeout.
+            assert!(!e.contains("initialize"), "{e}");
+            assert!(e.contains("exit status: 3"), "{e}");
+        }
         other => panic!("expected the dead server to be restarted or reported, got {other:?}"),
     }
     assert_eq!(st.starts, 2, "the second call restarted the server");
