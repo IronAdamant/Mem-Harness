@@ -164,11 +164,25 @@ pointers come only from Adsertio (`adsertio_view`).
 
 ## Known limits
 
-- A process that a backend server starts and leaves holding the server's
-  stdin, without reading it, can keep that connection's writer thread
-  blocked in `write` until the process exits. Nothing waits on that thread
-  (calls time out, and shutdown kills the server), so it costs one idle
-  thread, not a hang. std cannot close a pipe under a blocked writer.
+- On Unix each backend server runs in its own process group, and when its
+  connection ends (exit, crash, write error, over-long line, shutdown) the
+  group gets TERM, then KILL after 500 ms. A process that left the group
+  (`setsid`, a daemonizing double fork) is not reached. With
+  `keep_children`, and on Windows (no groups; only the server itself is
+  killed), a process the server started that keeps the server's pipes open
+  keeps that connection's threads alive until it exits: the reader and
+  stderr threads wait for EOF, and the writer can stay blocked in `write`
+  if that process holds stdin without reading it. Nothing waits on those
+  threads (calls time out, the exit is noticed without stdout EOF, and the
+  last replies are waited for 1 s at most), so it costs idle threads per
+  restart, not a hang. std cannot close a pipe under a blocked thread.
+- A backend's event sink runs on its stdout reader thread, so a slow sink
+  (the proxy relaying progress to a client that reads slowly) delays the
+  replies behind it; after the server exits, a reply still being read is
+  waited for until the waiting calls' deadlines.
+- `call_s` counts from when the call is sent. A call that has to start the
+  server first waits for the start too (bounded by `handshake_s`); its
+  cancel token is honoured during that wait, and the start goes on.
 - Hook timeouts send the command's process group TERM, then KILL after
   200 ms. A process that left the group (`setsid`) is not reached; its
   output is no longer waited on.
