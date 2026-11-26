@@ -2,7 +2,7 @@
 //! docs promise; a failure is the defect.
 
 use mh_core::config::{self, Config};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 static ENV: Mutex<()> = Mutex::new(());
@@ -228,13 +228,10 @@ fn glob_edges() {
     assert!(glob("", ""));
 }
 
-fn mode(p: &Path, m: u32) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
-    }
-    let _ = (p, m);
+#[cfg(unix)]
+fn mode(p: &std::path::Path, m: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
 }
 
 /// F4: `find_command` takes the first PATH hit even when it is not
