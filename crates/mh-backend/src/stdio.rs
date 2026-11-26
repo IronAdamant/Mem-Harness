@@ -327,20 +327,21 @@ impl Core {
         }
     }
 
-    /// The connection is over: fail every waiting call with `reason`, make
-    /// sure the process is gone, update the status and the storm guard,
-    /// and report the exit. Runs once per connection.
+    /// The connection is over: make sure the process is gone, update the
+    /// status and the storm guard, then fail every waiting call with
+    /// `reason` and report the exit. Runs once per connection.
     fn end(&self, conn: &Arc<Conn>, reason: String) {
         if conn.ended.swap(true, Ordering::SeqCst) {
             return;
         }
-        {
+        // New calls fail from here on. Waiting calls are failed only after
+        // the status says why, so a caller that sees the error and then
+        // reads the status finds the same reason there.
+        let waiting: Vec<_> = {
             let mut p = lock(&conn.pending);
             p.dead = Some(reason.clone());
-            for (_, tx) in p.waiting.drain() {
-                let _ = tx.send(Err(CallError::Unavailable(reason.clone())));
-            }
-        }
+            p.waiting.drain().map(|(_, tx)| tx).collect()
+        };
         *lock(&conn.stdin) = None;
         conn.reap(Duration::ZERO);
         let closing = conn.closing.load(Ordering::SeqCst);
@@ -361,6 +362,9 @@ impl Core {
                     inner.quick_exits = 0;
                 }
             }
+        }
+        for tx in waiting {
+            let _ = tx.send(Err(CallError::Unavailable(reason.clone())));
         }
         if !closing && conn.ready.load(Ordering::SeqCst) {
             (self.sink)(&self.name, BackendEvent::Exited(reason));
