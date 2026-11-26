@@ -247,6 +247,30 @@ pub fn run<R: BufRead, W: Write + Send + 'static>(
             .unwrap_or_else(|e| e.into_inner())
             .0;
     }
+    drop(active);
+    // A fetch that passed its `closing` check just before shutdown began can
+    // still start its backend after the stop above. Wait for running
+    // fetches (bounded), then stop every backend again; stopping one that
+    // is not running does nothing.
+    let deadline = Instant::now() + DRAIN_WAIT;
+    {
+        let mut st = lock(&shared.state);
+        while st.slots.iter().any(|s| s.fetching) {
+            let now = Instant::now();
+            if now >= deadline {
+                log("a backend was still starting at exit");
+                break;
+            }
+            st = shared
+                .state_cv
+                .wait_timeout(st, deadline - now)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+    for b in shared.backends().iter() {
+        b.shutdown();
+    }
     result
 }
 

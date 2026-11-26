@@ -30,6 +30,10 @@ struct Fake {
     release: AtomicBool,
     saw_cancel: AtomicBool,
     shut: AtomicBool,
+    /// `start` finished (past the gate).
+    started: AtomicBool,
+    /// `shutdown` ran after `start` finished.
+    shut_after_start: AtomicBool,
 }
 
 fn tool(name: &str) -> Value {
@@ -74,6 +78,7 @@ impl Backend for Fake {
         {
             return Err(CallError::Timeout("no initialize reply within 30 s".into()));
         }
+        self.started.store(true, Ordering::SeqCst);
         match &self.fail_start {
             Some(e) => Err(CallError::Unavailable(e.clone())),
             None => Ok(()),
@@ -158,6 +163,9 @@ impl Backend for Fake {
     }
     fn shutdown(&self) {
         self.shut.store(true, Ordering::SeqCst);
+        if self.started.load(Ordering::SeqCst) {
+            self.shut_after_start.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -837,6 +845,35 @@ fn first_list_waits_for_a_slow_start_without_blocking_input() {
     let out = h.finish();
     // The backend settled before the client saw a list: no list_changed.
     assert!(!out.iter().any(|v| v.get("method").is_some()), "{out:?}");
+}
+
+/// A backend still starting when input ends is stopped once its start
+/// finishes, so no server outlives the harness.
+#[test]
+fn a_backend_that_finishes_starting_during_shutdown_is_stopped() {
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let slow = Arc::new(Fake {
+        gate: Some(gate.clone()),
+        ..Fake::new("beta", &["echo"])
+    });
+    let (a, r, _) = three();
+    let h = start(vec![], vec![a, r, slow.clone()]);
+    h.init();
+    let opener = {
+        let gate = gate.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+        })
+    };
+    h.finish();
+    opener.join().unwrap();
+    assert!(slow.started.load(Ordering::SeqCst));
+    assert!(
+        slow.shut_after_start.load(Ordering::SeqCst),
+        "the backend started after shutdown and was never stopped"
+    );
 }
 
 #[test]

@@ -4,8 +4,9 @@
 //! that starts a background process can exit while that process still holds
 //! its stdout or stderr open; the reads would then wait for the background
 //! process. So the reads are abandoned at the deadline too, and on Unix the
-//! child runs in its own process group, which is killed (`kill -TERM
-//! -<pgid>`, std only) on timeout or when the reads outlast the deadline.
+//! child runs in its own process group, which is killed (`kill -TERM`,
+//! then `-KILL` for anything that ignores it; std only) on timeout or when
+//! the reads outlast the deadline.
 //! On Windows only the child itself is killed.
 
 use std::io::Read;
@@ -91,22 +92,38 @@ fn own_group(cmd: &mut Command) {
 #[cfg(not(unix))]
 fn own_group(_cmd: &mut Command) {}
 
-/// Signal the child's process group (its id is the child's pid), which
-/// also reaches any background process it started.
+/// Stop the child's process group (its id is the child's pid), which also
+/// reaches any background process it started: TERM first, then KILL after
+/// [`TERM_GRACE`] for anything that ignored it. This only runs on the
+/// timeout path, so the short wait costs nothing in a normal run.
 #[cfg(unix)]
 fn kill_group(pid: u32) {
     let kill = ["/bin/kill", "/usr/bin/kill"]
         .into_iter()
         .find(|p| Path::new(p).is_file())
         .unwrap_or("kill");
-    let _ = Command::new(kill)
-        .arg("-TERM")
-        .arg(format!("-{pid}"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    let signal = |sig: &str| {
+        Command::new(kill)
+            .arg(sig)
+            .arg("--")
+            .arg(format!("-{pid}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    // `kill` fails once no process is left in the group.
+    if signal("-TERM") {
+        std::thread::sleep(TERM_GRACE);
+        signal("-KILL");
+    }
 }
+
+/// How long a process group gets to exit on TERM before it is sent KILL.
+#[cfg(unix)]
+const TERM_GRACE: Duration = Duration::from_millis(200);
 
 #[cfg(not(unix))]
 fn kill_group(_pid: u32) {}
@@ -232,5 +249,30 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
         std::thread::sleep(Duration::from_millis(2500));
         assert!(!marker.exists(), "the background process outlived the kill");
+    }
+
+    /// A background process that ignores TERM is still stopped (by KILL).
+    #[test]
+    fn a_process_ignoring_term_is_killed() {
+        let cwd = std::env::temp_dir();
+        let marker = cwd.join(format!("mh-run-noterm-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!(
+            "(trap '' TERM; sleep 2; touch '{}') & sleep 30",
+            marker.display()
+        );
+        let e = run_command(
+            "/bin/sh",
+            &["-c", &script],
+            &cwd,
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(e.contains("timed out"), "{e}");
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(
+            !marker.exists(),
+            "a process that ignored TERM outlived the kill"
+        );
     }
 }

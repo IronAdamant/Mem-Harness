@@ -20,11 +20,12 @@ Fixes from a full adversarial review (32 findings, 28 reproduced with failing te
 - **Proxy:**
   - a backend that failed to start is retried (on a call, on `tools/list` and on a backoff), and `list_changed` is sent when its tools appear;
   - a backend panic answers the call with an error;
+  - a backend still starting when the harness exits is stopped once its start finishes;
   - a request with an id but no method gets -32600, and a bad cursor gets -32602;
   - an unknown protocol version gets the newest one; 2025-03-26 is dropped;
   - stdin lines are capped.
 - **Hooks:**
-  - command timeouts hold even when a command leaves a process behind (the process group is killed on Unix);
+  - command timeouts hold even when a command leaves a process behind (on Unix the process group gets TERM, then KILL);
   - `MEM_HARNESS_PROFILE` typos are reported instead of crashing;
   - a hook never exits non-zero.
 - **Memory hooks:**

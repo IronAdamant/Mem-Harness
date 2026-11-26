@@ -155,3 +155,17 @@ Decided 2026-11-26: the Relatum evidence adapter lives in **Adsertio itself**
 verdict. The harness has no verdict tool of its own; `mh-adapters::relatum`
 only reads notes to list active rules in the brief. Verdicts on `relatum:`
 pointers come only from Adsertio (`adsertio_view`).
+
+## Known limits
+
+- A process that a backend server starts and leaves holding the server's
+  stdin, without reading it, can keep that connection's writer thread
+  blocked in `write` until the process exits. Nothing waits on that thread
+  (calls time out, and shutdown kills the server), so it costs one idle
+  thread, not a hang. std cannot close a pipe under a blocked writer.
+- Hook timeouts send the command's process group TERM, then KILL after
+  200 ms. A process that left the group (`setsid`) is not reached; its
+  output is no longer waited on.
+- The stop check sees only edits made through the editing tools in
+  `brief.edit_tools`; edits made with shell commands are not seen.
+
