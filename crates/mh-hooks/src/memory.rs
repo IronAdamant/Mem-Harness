@@ -362,7 +362,10 @@ mod tests {
         assert!(unrecorded_items("no heading\n- decision: x\n").is_empty());
         let long = format!("## Not yet recorded\n- finding: {}\n", "é".repeat(300));
         assert_eq!(unrecorded_items(&long)[0].1.chars().count(), MAX_SUMMARY);
-        let many: String = (0..40).map(|i| format!("- finding: f{i}\n")).collect();
+        let many = (0..40)
+            .map(|i| format!("- finding: f{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert_eq!(
             unrecorded_items(&format!("{UNRECORDED_HEADING}\n{many}")).len(),
             MAX_ITEMS
