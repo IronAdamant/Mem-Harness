@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 Fixes from a second adversarial review (30 confirmed, 15 plausible findings), and the known limits, except Windows-specific work.
 
