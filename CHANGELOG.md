@@ -17,6 +17,29 @@ Fixes from a second adversarial review (30 confirmed, 15 plausible findings), an
 - `Value::obj` with a repeated key keeps one entry, as parsing does.
 - `print-config` and the usage text point at `~/.mem-harness/harness.json` and list `MEM_HARNESS_PROFILE`.
 
+**Backends** (Unix; Windows is unchanged)
+- Each server runs in its own process group, which is stopped (TERM, then KILL) when its connection ends. A server started through `sh -c` or `npx` no longer survives shutdown, and a process it leaves holding the pipes no longer leaks two threads per restart. Set `keep_children` to opt out.
+- A connection that ends late no longer overwrites a newer connection's status.
+- Cancelling a call is honoured while its server is still starting.
+- A large reply that arrives just before the server exits is no longer lost.
+- `initialize` is never cancelled (the spec forbids it).
+- Memory and CPU:
+  - the read buffer shrinks after a huge line;
+  - ping replies are dropped while the write backlog is large;
+  - a server that stops reading stdin is stopped once 32 MiB is waiting;
+  - an idle server costs far less polling: 9 idle backends now use about 0.3% of a core.
+
+**Proxy**
+- Calls waiting on a backend that failed to start share one start and one 60 s deadline, instead of starting it once each.
+- A call is no longer answered "unknown tool" when another fetch replaced its own.
+- A cancelled call stops waiting at once.
+- `logging` is declared, `logging/setLevel` works, and relayed log messages below the set level are dropped.
+- Shutdown takes at most about 3 s, down from about 6 s.
+- A message of exactly the 64 MiB cap is accepted.
+- A duplicate in-flight request id gets -32600.
+- Refetches after tools/list_changed are coalesced.
+- The retry timer no longer loses a backend after a thread-spawn failure.
+
 **Hooks**
 - New hook event `prompt-submit` (UserPromptSubmit; `mem-harness install` wires it). It prints `{}` and records where the working tree stands, so the stop check sees edits made with shell commands too. Re-run `mem-harness install` and merge the new `UserPromptSubmit` entry.
 - The stop check, in a git repository: the turn edited files when the tree changed since the turn began (git `HEAD`, `git status` and each listed file's size and time) and the turn ran an edit or shell tool. Edits you make in your editor while the agent only reads are not blamed on it. Outside git it still goes by the edit tools in the transcript.
