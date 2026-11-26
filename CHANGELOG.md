@@ -13,6 +13,9 @@ Fixes from a second adversarial review (30 confirmed, 15 plausible findings), an
 - Unknown keys are errors inside every object, not only at the top level, so a typo cannot silently turn off `env_pass`.
 - `MEM_HARNESS_CONFIG` must be an absolute path. A relative one would have been read from the repository.
 - Command lookup skips files without an execute bit, as the shell does.
+- Command lookup ignores relative and empty `PATH` entries (since 0.3.0), so a program is never found through the folder the harness was started in.
+- `Value::obj` with a repeated key keeps one entry, as parsing does.
+- `print-config` and the usage text point at `~/.mem-harness/harness.json` and list `MEM_HARNESS_PROFILE`.
 
 ## 0.3.0
 
