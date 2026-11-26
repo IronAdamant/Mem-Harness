@@ -2,6 +2,7 @@
 
 pub mod brief;
 pub mod hook;
+pub mod memory;
 mod run;
 pub mod stores;
 

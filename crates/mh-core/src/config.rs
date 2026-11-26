@@ -56,6 +56,11 @@ pub struct Route {
 pub struct BriefConfig {
     pub budget_chars: usize,
     pub command_timeout_s: u64,
+    /// Stop and SubagentStop: when a turn edited files but saved no note,
+    /// rule or claim, ask once to save them before stopping.
+    pub nudge_on_stop: bool,
+    /// PostCompact: save the summary's "Not yet recorded" lines as Libellus notes.
+    pub save_unrecorded_on_compact: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -321,6 +326,8 @@ fn parse_config(v: &Value, _source: &str) -> Result<Config, String> {
         None => BriefConfig {
             budget_chars: 8000,
             command_timeout_s: 10,
+            nudge_on_stop: true,
+            save_unrecorded_on_compact: true,
         },
         Some(b) => BriefConfig {
             budget_chars: b
@@ -333,6 +340,14 @@ fn parse_config(v: &Value, _source: &str) -> Result<Config, String> {
                 .and_then(Value::as_i64)
                 .unwrap_or(10)
                 .clamp(1, 120) as u64,
+            nudge_on_stop: b
+                .get("nudge_on_stop")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            save_unrecorded_on_compact: b
+                .get("save_unrecorded_on_compact")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
         },
     };
 

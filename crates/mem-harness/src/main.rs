@@ -13,12 +13,13 @@ mem-harness: one MCP server and one set of hooks for the suite tools
 
 Usage:
   mem-harness mcp                       serve MCP on stdio (what Claude Code starts)
-  mem-harness hook <event>              run a Claude Code hook; event: session-start | subagent-start
+  mem-harness hook <event>              run a Claude Code hook; event: session-start | subagent-start |
+                                        pre-compact | post-compact | stop | subagent-stop
   mem-harness brief [--agent NAME]      print the merged compaction brief
   mem-harness init                      create the Relatum, Libellus and Adsertio stores here if missing
   mem-harness ownership                 print who owns each feature and what is hidden where
   mem-harness doctor                    check config, project and every backend's binary
-  mem-harness install                   print the .mcp.json entry and hook settings to paste
+  mem-harness install                   print the user-wide MCP entry and hook settings to paste
   mem-harness print-config              print the built-in harness.json (copy to .mem-harness/harness.json to edit)
   mem-harness --version
 
@@ -113,7 +114,7 @@ fn natives(root: &Path, cfg: &Config) -> Vec<mh_proxy::NativeTool> {
             (
                 "description",
                 Value::str(
-                    "The merged brief (Libellus notes and board, Relatum rules, unverified Adsertio claims, open Chisel issues), read fresh. Call after compaction or when unsure what was decided.",
+                    "The merged brief (Libellus notes and board, Relatum rules, unverified or refuted Adsertio claims, open Chisel issues), read fresh. Call after compaction or when unsure what was decided.",
                 ),
             ),
             ("inputSchema", schema(vec![("agent", string_prop("Agent name; default main. Sub-agents pass their own."))], &[])),
@@ -186,7 +187,10 @@ fn cmd_mcp() -> Result<(), String> {
 /// A hook never stops the session: errors go to stderr and the exit code is 0.
 fn cmd_hook(rest: &[String]) -> ExitCode {
     let Some(event) = rest.first() else {
-        eprintln!("mem-harness hook: give an event (session-start | subagent-start)");
+        eprintln!(
+            "mem-harness hook: give an event: {}",
+            mh_hooks::hook::EVENTS
+        );
         return ExitCode::SUCCESS;
     };
     let mut stdin = String::new();
@@ -285,10 +289,15 @@ fn cmd_doctor(rest: &[String]) -> ExitCode {
             }
         }
     }
-    for hook_cmd in ["libellus", "adsertio", "chisel"] {
-        if project::find_command(hook_cmd).is_none() {
+    for (cli, needs) in [
+        ("libellus", "the brief, init and post-compact notes"),
+        ("adsertio", "the brief and init"),
+        ("chisel", "the brief"),
+        ("relatum", "init"),
+    ] {
+        if project::find_command(cli).is_none() {
             ok = false;
-            println!("FAIL brief    `{hook_cmd}` CLI not found; its brief section will say so");
+            println!("FAIL cli      `{cli}` not found; {needs} need it");
         }
     }
     if ok {
@@ -298,53 +307,59 @@ fn cmd_doctor(rest: &[String]) -> ExitCode {
     }
 }
 
+/// The hook events `install` wires, as (settings key, matcher, mem-harness event).
+const HOOKS: &[(&str, Option<&str>, &str)] = &[
+    (
+        "SessionStart",
+        Some("startup|resume|clear|compact"),
+        "session-start",
+    ),
+    ("SubagentStart", None, "subagent-start"),
+    ("PreCompact", None, "pre-compact"),
+    ("PostCompact", None, "post-compact"),
+    ("Stop", None, "stop"),
+    ("SubagentStop", None, "subagent-stop"),
+];
+
 fn cmd_install() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot find own path: {e}"))?;
     let exe = exe.display().to_string();
-    let cmd = |args: &[&str]| -> Value {
-        Value::obj(vec![
-            ("type", Value::str("command")),
-            ("command", Value::str(exe.clone())),
-            (
-                "args",
-                Value::Array(args.iter().map(|a| Value::str(*a)).collect()),
-            ),
-        ])
-    };
-    let mcp = Value::obj(vec![(
-        "mcpServers",
-        Value::obj(vec![(
-            "mem-harness",
-            Value::obj(vec![
-                ("type", Value::str("stdio")),
-                ("command", Value::str(exe.clone())),
-                ("args", Value::Array(vec![Value::str("mcp")])),
-            ]),
-        )]),
-    )]);
     let hooks = Value::obj(vec![(
         "hooks",
-        Value::obj(vec![
-            (
-                "SessionStart",
-                Value::Array(vec![Value::obj(vec![
-                    ("matcher", Value::str("startup|resume|clear|compact")),
-                    ("hooks", Value::Array(vec![cmd(&["hook", "session-start"])])),
-                ])]),
-            ),
-            (
-                "SubagentStart",
-                Value::Array(vec![Value::obj(vec![(
-                    "hooks",
-                    Value::Array(vec![cmd(&["hook", "subagent-start"])]),
-                )])]),
-            ),
-        ]),
+        Value::obj(
+            HOOKS
+                .iter()
+                .map(|(key, matcher, event)| {
+                    let mut entry = Vec::new();
+                    if let Some(m) = matcher {
+                        entry.push(("matcher", Value::str(*m)));
+                    }
+                    entry.push((
+                        "hooks",
+                        Value::Array(vec![Value::obj(vec![
+                            ("type", Value::str("command")),
+                            ("command", Value::str(exe.clone())),
+                            (
+                                "args",
+                                Value::Array(vec![Value::str("hook"), Value::str(*event)]),
+                            ),
+                        ])]),
+                    ));
+                    (*key, Value::Array(vec![Value::obj(entry)]))
+                })
+                .collect(),
+        ),
     )]);
-    println!("# 1. Project .mcp.json (replaces the nine separate server entries for this project):\n{}\n", mcp.to_json());
-    println!("# 2. .claude/settings.json hooks:\n{}\n", hooks.to_json());
-    println!(
-        "# 3. Remove the separate Libellus and Adsertio SessionStart/SubagentStart hooks from ~/.claude/settings.json,\n#    and the nine per-tool MCP servers for this project; otherwise the brief and tools appear twice."
-    );
+    println!("# 0. Back up both files first (Roll back in the README restores these):");
+    println!("stamp=$(date +%Y%m%d-%H%M%S)");
+    println!("cp ~/.claude.json ~/.claude.json.bak-mem-harness-$stamp");
+    println!("cp ~/.claude/settings.json ~/.claude/settings.json.bak-mem-harness-$stamp\n");
+    println!("# 1. Add the MCP server for every project (writes ~/.claude.json):");
+    println!("claude mcp add --scope user mem-harness -- '{exe}' mcp\n");
+    println!("#    and remove the per-tool servers it replaces, for example:");
+    println!("#    claude mcp remove --scope user libellus   (likewise relatum, adsertio, chisel, ...)\n");
+    println!("# 2. Merge this into ~/.claude/settings.json, replacing the Libellus and Adsertio hooks:\n{}\n", hooks.to_json());
+    println!("# 3. Restart Claude Code; /mcp should show mem-harness connected.");
+    println!("#    Old servers or hooks left in place show every tool and the brief twice.");
     Ok(())
 }

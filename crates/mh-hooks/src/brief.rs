@@ -260,7 +260,7 @@ pub fn claims_section(res: Result<CmdOut, String>) -> Option<Section> {
     if claims.is_empty() {
         return None;
     }
-    let mut lines = vec!["## Claims not verified".to_string()];
+    let mut lines = vec!["## Claims unverified or refuted".to_string()];
     for c in claims {
         let f = |k: &str| c.get(k).and_then(Value::as_str).unwrap_or("?");
         lines.push(format!(
@@ -510,7 +510,7 @@ mod tests {
         assert_eq!(
             s.lines,
             [
-                "## Claims not verified",
+                "## Claims unverified or refuted",
                 "- [refuted] c1: Tests pass",
                 "- [unverified] c2: s"
             ]

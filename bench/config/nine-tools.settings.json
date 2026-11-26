@@ -1,0 +1,67 @@
+{
+ "hooks": {
+  "SessionStart": [
+   {
+    "matcher": "startup|resume|compact",
+    "hooks": [
+     {
+      "type": "command",
+      "command": "libellus",
+      "args": [
+       "hook-run",
+       "session-start",
+       "--agent",
+       "main"
+      ]
+     },
+     {
+      "type": "command",
+      "command": "adsertio",
+      "args": [
+       "view",
+       "--compact",
+       "--states",
+       "unverified",
+       "--states",
+       "refuted",
+       "--limit",
+       "50",
+       "--if-store"
+      ]
+     }
+    ]
+   }
+  ],
+  "SubagentStart": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "libellus",
+      "args": [
+       "hook-run",
+       "subagent-start"
+      ]
+     },
+     {
+      "type": "command",
+      "command": "adsertio",
+      "args": [
+       "view",
+       "--compact",
+       "--states",
+       "unverified",
+       "--states",
+       "refuted",
+       "--limit",
+       "50",
+       "--if-store",
+       "--wrap",
+       "claude-subagent"
+      ]
+     }
+    ]
+   }
+  ]
+ }
+}

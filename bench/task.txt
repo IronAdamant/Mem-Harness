@@ -1,0 +1,9 @@
+You are working in this repository with the project tools available to you over MCP. Do not edit any source file. Do these in order, using the most suitable tool for each, and keep your final answer short:
+
+1. Record a project-wide rule that every agent must follow: a constraint with id `_shared/no-deps`, summary "No crates.io dependencies; std only". Create the store first if it does not exist.
+2. Find where the function `valid_id` is defined and list every place that references it.
+3. Say which tests should run if `src/grammar.rs` changes.
+4. Record a private decision note (for yourself, agent `main`) summarising what you found in steps 2-3.
+5. Make a claim "The no-deps rule is in force" whose evidence is the Relatum note from step 1, then report the claim's verdict as computed by the tool.
+
+Final answer: the definition location, the reference count, the test list, and the claim verdict.

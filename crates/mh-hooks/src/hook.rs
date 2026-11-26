@@ -49,6 +49,10 @@ fn subagent_from(stdin: &str) -> Result<String, String> {
     ))
 }
 
+/// The events `mem-harness hook` handles.
+pub const EVENTS: &str =
+    "session-start, subagent-start, pre-compact, post-compact, stop or subagent-stop";
+
 /// Handle one hook event and return the one-line JSON for Claude Code's
 /// stdout (no trailing newline).
 pub fn run_hook(cfg: &Config, project: &Path, event: &str, stdin: &str) -> Result<String, String> {
@@ -66,9 +70,17 @@ pub fn run_hook(cfg: &Config, project: &Path, event: &str, stdin: &str) -> Resul
             );
             Ok(output("SubagentStart", &text))
         }
-        other => Err(format!(
-            "unknown hook event \"{other}\"; use session-start or subagent-start"
-        )),
+        "pre-compact" => Ok(crate::memory::pre_compact_instructions()),
+        "post-compact" => {
+            let report = crate::memory::post_compact(cfg, project, stdin, &crate::run_command)?;
+            if !report.is_empty() {
+                eprintln!("mem-harness post-compact: {report}");
+            }
+            Ok("{}".to_string())
+        }
+        "stop" => crate::memory::stop(cfg, project, stdin, false),
+        "subagent-stop" => crate::memory::stop(cfg, project, stdin, true),
+        other => Err(format!("unknown hook event \"{other}\"; use {EVENTS}")),
     }
 }
 
@@ -149,11 +161,15 @@ mod tests {
                 "{bad}"
             );
         }
-        let e = run_hook(&cfg, &dir, "stop", "{}").unwrap_err();
+        let e = run_hook(&cfg, &dir, "session-end", "{}").unwrap_err();
         assert!(
-            e.contains("session-start") && e.contains("subagent-start"),
+            e.contains("pre-compact") && e.contains("subagent-stop"),
             "{e}"
         );
+        assert_eq!(run_hook(&cfg, &dir, "stop", "{}").unwrap(), "{}");
+        assert!(run_hook(&cfg, &dir, "pre-compact", "")
+            .unwrap()
+            .contains(crate::memory::UNRECORDED_HEADING));
     }
 
     #[test]
