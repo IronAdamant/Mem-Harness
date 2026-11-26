@@ -30,6 +30,8 @@ struct Fake {
     release: AtomicBool,
     saw_cancel: AtomicBool,
     shut: AtomicBool,
+    /// `start` was entered (before the gate).
+    entered: AtomicBool,
     /// `start` finished (past the gate).
     started: AtomicBool,
     /// `shutdown` ran after `start` finished.
@@ -65,6 +67,7 @@ impl Backend for Fake {
         &self.name
     }
     fn start(&self) -> Result<(), CallError> {
+        self.entered.store(true, Ordering::SeqCst);
         if let Some(g) = &self.gate {
             let mut open = g.0.lock().unwrap();
             while !*open {
@@ -859,6 +862,9 @@ fn a_backend_that_finishes_starting_during_shutdown_is_stopped() {
     let (a, r, _) = three();
     let h = start(vec![], vec![a, r, slow.clone()]);
     h.init();
+    // The startup fetch must be inside `start` (past its closing check)
+    // before input ends; otherwise it rightly never starts at all.
+    slow.wait_until("start entered", || slow.entered.load(Ordering::SeqCst));
     let opener = {
         let gate = gate.clone();
         thread::spawn(move || {
