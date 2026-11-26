@@ -128,6 +128,7 @@ fn natives(root: &Path, cfg: &Config) -> Vec<mh_proxy::NativeTool> {
         }),
     };
     let init_root = root.to_path_buf();
+    let init_stores = cfg.stores.clone();
     let init = mh_proxy::NativeTool {
         def: Value::obj(vec![
             ("name", Value::str("harness_init")),
@@ -139,13 +140,13 @@ fn natives(root: &Path, cfg: &Config) -> Vec<mh_proxy::NativeTool> {
             ),
             ("inputSchema", schema(vec![], &[])),
         ]),
-        run: Arc::new(move |_args: Value| Ok(text_result(init_report(&init_root)))),
+        run: Arc::new(move |_args: Value| Ok(text_result(init_report(&init_root, &init_stores)))),
     };
     vec![brief, init]
 }
 
-fn init_report(root: &Path) -> String {
-    let out = mh_hooks::stores::init(root, &mh_hooks::run_command);
+fn init_report(root: &Path, stores: &[config::StoreSpec]) -> String {
+    let out = mh_hooks::stores::init(stores, root, &mh_hooks::run_command);
     let rows: Vec<Value> = out
         .iter()
         .map(|(tool, outcome)| {
@@ -163,8 +164,8 @@ fn init_report(root: &Path) -> String {
 }
 
 fn cmd_init() -> Result<(), String> {
-    let (root, _) = load()?;
-    let out = mh_hooks::stores::init(&root, &mh_hooks::run_command);
+    let (root, cfg) = load()?;
+    let out = mh_hooks::stores::init(&cfg.stores, &root, &mh_hooks::run_command);
     let mut failed = false;
     for (tool, outcome) in &out {
         failed |= outcome.starts_with("failed");

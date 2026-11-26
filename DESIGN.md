@@ -93,13 +93,39 @@ model knows. Each event does what a hook can do (`mh_hooks::memory`):
 | SubagentStart | `subagent-start` | injects the sub-agent's name and its brief |
 | PreCompact | `pre-compact` | prints instructions for the summary: end with `## Not yet recorded`, one `- <kind>: ...` line per unsaved decision, dead end, question or result |
 | PostCompact | `post-compact` | saves those lines as Libellus notes for `main`, tagged `from-compact` (`brief.save_unrecorded_on_compact`) |
-| Stop, SubagentStop | `stop`, `subagent-stop` | when the turn edited files and called no save tool, blocks once and asks the agent to save; `stop_hook_active` lets it stop the second time (`brief.nudge_on_stop`) |
+| Stop, SubagentStop | `stop`, `subagent-stop` | when the turn edited files and called no save tool, blocks once and asks the agent to save, naming only the save tools whose store exists; `stop_hook_active` lets it stop the second time (`brief.nudge_on_stop`) |
+
+The brief's sections are `brief_sections` in the config, run concurrently
+and kept in order; `parse` picks the reader (`text` puts the command's
+stdout under `heading`; the others are the built-in Libellus, Relatum,
+Adsertio and Chisel readers). The stores the Setup section, `harness_init`
+and the hooks check are `stores`. A store path that is a symlink or a file
+is refused, as Libellus refuses it: the brief names it with the reason and
+`harness_init` does not run over it.
+
+The "Not yet recorded" list is found under that label as a heading of any
+level, a numbered (`8. Not yet recorded:`) or a bold line, any case; fenced
+code is skipped, and the list ends at a heading of the same or a higher
+level or at another numbered or bold label. Each line has control
+characters and runs of spaces collapsed before it is clipped to 200
+characters. Lines already saved as a `from-compact` note of `main` (the
+next summary repeats the last list), and repeats within one summary, are
+skipped. If Libellus refuses the batch, each line is retried alone.
 
 The stop check reads the last 8 MB of the transcript and looks at the turn
-after the last prompt. Edit tools are `Edit`, `Write`, `MultiEdit` and
-`NotebookEdit`; shell edits are not seen. A project with none of the three
-stores is never nudged. SessionEnd is not used: it cannot reach the model
-and has 1.5 seconds.
+after the last prompt. A prompt is a user entry someone typed: meta
+entries, the compact summary, entries whose `origin.kind` is not `human`
+(task notifications, peer and coordinator messages), text that is only
+`<system-reminder>` blocks, local-command and shell-escape output, and
+interrupt markers do not start a turn. Edit and save tools are
+`brief.edit_tools` and `brief.save_tools` (default edit tools `Edit`,
+`Write`, `MultiEdit`, `NotebookEdit`); shell edits are not seen. A project
+with none of the stores is never nudged. SessionEnd is not used: it cannot
+reach the model and has 1.5 seconds.
+
+Hook commands run with the brief's timeout over the whole run, output
+included; on Unix each runs in its own process group, killed on timeout
+(or when something it started still holds its output at the deadline).
 
 ## Claims about rules
 
