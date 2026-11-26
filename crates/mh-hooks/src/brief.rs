@@ -1,6 +1,9 @@
-//! The merged brief: Libellus, Relatum rules, Adsertio claims, Chisel issues.
+//! The merged brief, composed from `Config.brief_sections` (built in:
+//! Libellus, Relatum rules, Adsertio claims, Chisel issues).
 
 use crate::run::{run_command, CmdOut};
+use crate::stores::State;
+use mh_core::config::SectionSpec;
 use mh_core::Config;
 use mh_json::Value;
 use std::path::Path;
@@ -147,43 +150,29 @@ fn text_lines(s: &str) -> Vec<String> {
     s.trim_end().lines().map(str::to_string).collect()
 }
 
-/// Section from `libellus brief` output. A missing store is silent.
-pub fn libellus_section(res: Result<CmdOut, String>) -> Option<Section> {
-    let w = 50;
+/// Lines from `libellus brief` output. A missing store is silent.
+pub fn libellus_lines(label: &str, res: Result<CmdOut, String>) -> Option<Vec<String>> {
     match res {
-        Err(e) => Some(Section::new(
-            w,
-            "libellus_brief",
-            vec![format!("- libellus: {}", one_line(&e, 160))],
-        )),
+        Err(e) => Some(vec![format!("- {label}: {}", one_line(&e, 160))]),
         Ok(o) if o.code != Some(0) => {
             if o.stderr.contains("no .libellus folder") {
                 return None;
             }
-            Some(Section::new(
-                w,
-                "libellus_brief",
-                vec![format!("- libellus: {}", first_err_line(&o))],
-            ))
+            Some(vec![format!("- {label}: {}", first_err_line(&o))])
         }
         Ok(o) if o.stdout.trim().is_empty() => None,
-        Ok(o) => Some(Section::new(w, "libellus_brief", text_lines(&o.stdout))),
+        Ok(o) => Some(text_lines(&o.stdout)),
     }
 }
 
-/// Section from the Relatum rules read natively. `None` is no store.
+/// Lines from the Relatum rules read natively. `None` is no store.
 /// Damaged notes are named (they are not rules until fixed, and Adsertio
 /// refuses them as proof), but never hide the good rules.
-pub fn rules_section(res: Option<Result<mh_adapters::relatum::Rules, String>>) -> Option<Section> {
-    let w = 20;
+pub fn rules_lines(
+    res: Option<Result<mh_adapters::relatum::Rules, String>>,
+) -> Option<Vec<String>> {
     let found = match res? {
-        Err(e) => {
-            return Some(Section::new(
-                w,
-                "relatum_ls",
-                vec![format!("- relatum: {}", one_line(&e, 160))],
-            ))
-        }
+        Err(e) => return Some(vec![format!("- relatum: {}", one_line(&e, 160))]),
         Ok(r) => r,
     };
     if found.rules.is_empty() && found.damaged.is_empty() {
@@ -222,19 +211,12 @@ pub fn rules_section(res: Option<Result<mh_adapters::relatum::Rules, String>>) -
             shown.join(", ")
         ));
     }
-    Some(Section::new(w, "relatum_ls", lines))
+    Some(lines)
 }
 
-/// Section from `adsertio view --compact ...` JSON (`{"claims":[...]}`).
-pub fn claims_section(res: Result<CmdOut, String>) -> Option<Section> {
-    let w = 20;
-    let err = |m: String| {
-        Some(Section::new(
-            w,
-            "adsertio_view",
-            vec![format!("- adsertio: {m}")],
-        ))
-    };
+/// Lines from `adsertio view --compact ...` JSON (`{"claims":[...]}`).
+pub fn claims_lines(label: &str, res: Result<CmdOut, String>) -> Option<Vec<String>> {
+    let err = |m: String| Some(vec![format!("- {label}: {m}")]);
     let o = match res {
         Err(e) => return err(one_line(&e, 160)),
         Ok(o) => o,
@@ -270,95 +252,128 @@ pub fn claims_section(res: Result<CmdOut, String>) -> Option<Section> {
             one_line(f("summary"), 200)
         ));
     }
-    Some(Section::new(w, "adsertio_view", lines))
+    Some(lines)
 }
 
-/// Section from `chisel issues --brief` lines.
-pub fn chisel_section(res: Result<CmdOut, String>) -> Option<Section> {
-    let w = 10;
-    let err = |m: String| Some(Section::new(w, "issues", vec![format!("- chisel: {m}")]));
+/// Lines from a command whose stdout is shown as is under `heading`
+/// (`chisel issues --brief` is one). Empty output is no section; a failure
+/// is one `- <label>: <reason>` line.
+pub fn text_section_lines(
+    label: &str,
+    heading: &str,
+    res: Result<CmdOut, String>,
+) -> Option<Vec<String>> {
     match res {
-        Err(e) => err(one_line(&e, 160)),
-        Ok(o) if o.code != Some(0) => err(first_err_line(&o)),
+        Err(e) => Some(vec![format!("- {label}: {}", one_line(&e, 160))]),
+        Ok(o) if o.code != Some(0) => Some(vec![format!("- {label}: {}", first_err_line(&o))]),
         Ok(o) if o.stdout.trim().is_empty() => None,
         Ok(o) => {
-            let mut lines = vec!["## Open test issues".to_string()];
+            let mut lines = vec![heading.to_string()];
             lines.extend(text_lines(&o.stdout));
-            Some(Section::new(w, "issues", lines))
+            Some(lines)
         }
     }
 }
 
-type Runner<'a> = dyn Fn(&str, &[&str], &Path, Duration) -> Result<CmdOut, String> + Sync + 'a;
+const CHISEL_HEADING: &str = "## Open test issues";
 
-/// Build the brief with an injectable command runner (for tests).
-pub fn compose_brief_with(cfg: &Config, project: &Path, agent: &str, run: &Runner) -> String {
-    let timeout = Duration::from_secs(cfg.brief.command_timeout_s.max(1));
-    let chisel = project.join(".chisel").exists();
-    let (a, r, c, h) = std::thread::scope(|s| {
-        let a = s.spawn(|| {
-            libellus_section(run(
-                "libellus",
-                &["brief", "--agent", agent],
-                project,
-                timeout,
-            ))
-        });
-        let r = s.spawn(|| {
-            let store = mh_adapters::relatum::store_dir(project)?;
-            rules_section(Some(mh_adapters::relatum::active_rules(&store)))
-        });
-        let c = s.spawn(|| {
-            let args = [
-                "view",
-                "--compact",
-                "--states",
-                "unverified",
-                "--states",
-                "refuted",
-                "--limit",
-                "50",
-                "--if-store",
-            ];
-            claims_section(run("adsertio", &args, project, timeout))
-        });
-        let h = s.spawn(|| {
-            chisel
-                .then(|| chisel_section(run("chisel", &["issues", "--brief"], project, timeout)))
-                .flatten()
-        });
-        let j = |x: std::thread::ScopedJoinHandle<Option<Section>>, name: &str| {
-            x.join().unwrap_or_else(|_| {
-                Some(Section::new(
-                    10,
-                    name,
-                    vec![format!("- {name}: section panicked")],
-                ))
-            })
-        };
-        (
-            j(a, "libellus_brief"),
-            j(r, "relatum_ls"),
-            j(c, "adsertio_view"),
-            j(h, "issues"),
-        )
-    });
-    let mut sections: Vec<Section> = Vec::new();
-    let missing = crate::stores::missing(project);
-    if !missing.is_empty() {
-        sections.push(Section::new(
-            5,
-            "harness_init",
-            vec![
-                "## Setup".to_string(),
-                format!(
-                    "- Not created yet here: {}. Call harness_init once before writing notes or claims.",
-                    missing.join(", ")
-                ),
-            ],
+/// The name a failure line starts with: the command's file name, or the
+/// section's name when it has no command.
+fn label(spec: &SectionSpec) -> String {
+    Path::new(&spec.command)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&spec.name)
+        .to_string()
+}
+
+/// One configured section: gate, run, read. `None` is no section.
+fn run_section(
+    spec: &SectionSpec,
+    project: &Path,
+    agent: &str,
+    timeout: Duration,
+    run: &Runner,
+) -> Option<Vec<String>> {
+    if !spec.only_if_exists.is_empty() && !project.join(&spec.only_if_exists).exists() {
+        return None;
+    }
+    if spec.parse == "relatum-rules" {
+        let store = mh_adapters::relatum::store_dir(project)?;
+        return rules_lines(Some(mh_adapters::relatum::active_rules(&store)));
+    }
+    let args: Vec<String> = spec
+        .args
+        .iter()
+        .map(|a| a.replace("{agent}", agent))
+        .collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let res = run(&spec.command, &args, project, timeout);
+    match spec.parse.as_str() {
+        "libellus" => libellus_lines(&label(spec), res),
+        "adsertio-claims" => claims_lines(&label(spec), res),
+        "chisel-issues" => text_section_lines(&label(spec), CHISEL_HEADING, res),
+        "text" => text_section_lines(&spec.name, &spec.heading, res),
+        other => Some(vec![format!("- {}: unknown parse {other:?}", spec.name)]),
+    }
+}
+
+/// The Setup section: stores `harness_init` would create, and stores the
+/// tools refuse (which it cannot fix).
+fn setup_section(cfg: &Config, project: &Path) -> Option<Section> {
+    let mut absent = Vec::new();
+    let mut lines = vec!["## Setup".to_string()];
+    let mut refused = Vec::new();
+    for (tool, state) in crate::stores::missing(&cfg.stores, project) {
+        match state {
+            State::Refused(why) => refused.push(format!("- {tool}: {}", one_line(&why, 240))),
+            _ => absent.push(tool),
+        }
+    }
+    if absent.is_empty() && refused.is_empty() {
+        return None;
+    }
+    if !absent.is_empty() {
+        lines.push(format!(
+            "- Not created yet here: {}. Call harness_init once before writing notes or claims.",
+            absent.join(", ")
         ));
     }
-    sections.extend([a, r, c, h].into_iter().flatten());
+    lines.extend(refused);
+    Some(Section::new(5, "harness_init", lines))
+}
+
+type Runner<'a> = dyn Fn(&str, &[&str], &Path, Duration) -> Result<CmdOut, String> + Sync + 'a;
+
+/// Build the brief with an injectable command runner (for tests). The
+/// sections are `cfg.brief_sections`, in order, each run on its own thread.
+pub fn compose_brief_with(cfg: &Config, project: &Path, agent: &str, run: &Runner) -> String {
+    let timeout = Duration::from_secs(cfg.brief.command_timeout_s.max(1));
+    let built: Vec<Option<Section>> = std::thread::scope(|s| {
+        let handles: Vec<_> = cfg
+            .brief_sections
+            .iter()
+            .map(|spec| {
+                (
+                    spec,
+                    s.spawn(move || run_section(spec, project, agent, timeout, run)),
+                )
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|(spec, h)| {
+                let lines = h
+                    .join()
+                    .unwrap_or_else(|_| Some(vec![format!("- {}: section panicked", spec.name)]))?;
+                Some(Section::new(spec.weight, &spec.name, lines))
+            })
+            .collect()
+    });
+    let mut sections: Vec<Section> = Vec::new();
+    sections.extend(setup_section(cfg, project));
+    sections.extend(built.into_iter().flatten());
     assemble(agent, &sections, cfg.brief.budget_chars)
 }
 
@@ -485,47 +500,55 @@ mod tests {
 
     #[test]
     fn libellus_cases() {
-        assert!(libellus_section(fail(
+        let l = |r| libellus_lines("libellus", r);
+        assert!(l(fail(
             "error: no .libellus folder here or above. Run `libellus init`"
         ))
         .is_none());
-        assert!(libellus_section(ok("  \n")).is_none());
-        let s = libellus_section(ok(
+        assert!(l(ok("  \n")).is_none());
+        let s = l(ok(
             "# Libellus brief for main\n\n## Current state\n- none\n",
         ))
         .unwrap();
-        assert_eq!(s.lines[0], "# Libellus brief for main");
-        assert_eq!(s.lines.len(), 4);
-        let s = libellus_section(Err("libellus not found on PATH".into())).unwrap();
-        assert_eq!(s.lines, ["- libellus: libellus not found on PATH"]);
-        let s = libellus_section(fail("error: store is damaged\nmore")).unwrap();
-        assert_eq!(s.lines, ["- libellus: store is damaged"]);
+        assert_eq!(s[0], "# Libellus brief for main");
+        assert_eq!(s.len(), 4);
+        let s = l(Err("libellus not found on PATH".into())).unwrap();
+        assert_eq!(s, ["- libellus: libellus not found on PATH"]);
+        let s = l(fail("error: store is damaged\nmore")).unwrap();
+        assert_eq!(s, ["- libellus: store is damaged"]);
     }
 
     #[test]
     fn claims_cases() {
+        let claims_section = |r| claims_lines("adsertio", r);
         assert!(claims_section(ok("")).is_none());
         assert!(claims_section(ok(r#"{"claims":[],"counts":{}}"#)).is_none());
         let s = claims_section(ok(r#"{"claims":[{"id":"c1","summary":"Tests\npass","verdict":"refuted","evidence":[]},{"id":"c2","summary":"s","verdict":"unverified"}],"truncated":false}"#)).unwrap();
         assert_eq!(
-            s.lines,
+            s,
             [
                 "## Claims unverified or refuted",
                 "- [refuted] c1: Tests pass",
                 "- [unverified] c2: s"
             ]
         );
-        assert!(claims_section(ok("garbage")).unwrap().lines[0]
-            .starts_with("- adsertio: output is not JSON"));
-        assert!(claims_section(fail("error: boom")).unwrap().lines[0].contains("boom"));
+        assert!(
+            claims_section(ok("garbage")).unwrap()[0].starts_with("- adsertio: output is not JSON")
+        );
+        assert!(claims_section(fail("error: boom")).unwrap()[0].contains("boom"));
     }
 
     #[test]
     fn chisel_cases() {
+        let chisel_section = |r| text_section_lines("chisel", CHISEL_HEADING, r);
         assert!(chisel_section(ok("")).is_none());
         let s = chisel_section(ok("chisel: 1 open test issue(s): x.\nSuspects: y\n")).unwrap();
-        assert_eq!(s.lines.len(), 3);
-        assert_eq!(s.lines[0], "## Open test issues");
+        assert_eq!(s.len(), 3);
+        assert_eq!(s[0], "## Open test issues");
+        assert_eq!(
+            chisel_section(fail("error: boom")).unwrap(),
+            ["- chisel: boom"]
+        );
     }
 
     #[test]
@@ -533,8 +556,8 @@ mod tests {
         use mh_adapters::relatum::{Note, Rules};
         let rules =
             |rules: Vec<Note>, damaged: Vec<(String, String)>| Some(Ok(Rules { rules, damaged }));
-        assert!(rules_section(None).is_none());
-        assert!(rules_section(rules(vec![], vec![])).is_none());
+        assert!(rules_lines(None).is_none());
+        assert!(rules_lines(rules(vec![], vec![])).is_none());
         let n = |i: usize| Note {
             id: format!("net/r{i}"),
             kind: "decision".into(),
@@ -546,26 +569,27 @@ mod tests {
             updated: None,
             body: String::new(),
         };
-        let s = rules_section(rules((0..17).map(n).collect(), vec![])).unwrap();
-        assert_eq!(s.lines.len(), 1 + 15 + 1);
-        assert_eq!(s.lines[1], "- net/r0 (decision): sum 0");
-        assert_eq!(s.lines[16], "- (+2 more: relatum_ls)");
-        assert!(rules_section(Some(Err("x: bad".into()))).unwrap().lines[0]
-            .starts_with("- relatum: x: bad"));
+        let s = rules_lines(rules((0..17).map(n).collect(), vec![])).unwrap();
+        assert_eq!(s.len(), 1 + 15 + 1);
+        assert_eq!(s[1], "- net/r0 (decision): sum 0");
+        assert_eq!(s[16], "- (+2 more: relatum_ls)");
+        assert!(
+            rules_lines(Some(Err("x: bad".into()))).unwrap()[0].starts_with("- relatum: x: bad")
+        );
         // Damaged notes are named after the good rules and never hide them.
         let bad = |id: &str| (id.to_string(), "why".to_string());
-        let s = rules_section(rules(vec![n(0)], vec![bad("a/x"), bad("b/y")])).unwrap();
-        assert_eq!(s.lines[1], "- net/r0 (decision): sum 0");
+        let s = rules_lines(rules(vec![n(0)], vec![bad("a/x"), bad("b/y")])).unwrap();
+        assert_eq!(s[1], "- net/r0 (decision): sum 0");
         assert_eq!(
-            s.lines[2],
+            s[2],
             "- DAMAGED, not rules until fixed (relatum_check says why): a/x, b/y"
         );
         let many: Vec<_> = (0..7).map(|i| bad(&format!("d/{i}"))).collect();
-        let s = rules_section(rules(vec![], many)).unwrap();
+        let s = rules_lines(rules(vec![], many)).unwrap();
         assert!(
-            s.lines[1].ends_with("d/0, d/1, d/2, d/3, d/4 (+2 more)"),
+            s[1].ends_with("d/0, d/1, d/2, d/3, d/4 (+2 more)"),
             "{}",
-            s.lines[1]
+            s[1]
         );
     }
 
@@ -592,6 +616,113 @@ mod tests {
         assert!(out.contains("- [unverified] c1: s"));
         assert!(out.contains("## Open test issues"));
         assert!(out.chars().count() <= cfg.brief.budget_chars);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fake tools' output for the built-in sections, in a project with
+    /// a Chisel store and no Relatum store.
+    fn golden_runner(prog: &str, a: &[&str], _: &Path, _: Duration) -> Result<CmdOut, String> {
+        match prog {
+            "libellus" => {
+                assert_eq!(a, ["brief", "--agent", "explore-1"]);
+                ok("# Libellus brief for explore-1\n\n## Current state\n- state\n")
+            }
+            "adsertio" => ok(r#"{"claims":[{"id":"c1","summary":"s","verdict":"unverified"}]}"#),
+            "chisel" => fail("error: chisel db locked"),
+            other => panic!("unexpected {other}"),
+        }
+    }
+
+    /// The built-in config gives exactly the brief the hard-coded sections
+    /// gave before they moved into config.
+    #[test]
+    fn builtin_sections_are_byte_identical() {
+        let cfg = Config::builtin();
+        if cfg
+            .stores
+            .iter()
+            .any(|s| std::env::var_os(&s.env).is_some())
+        {
+            return; // the environment points the tools elsewhere
+        }
+        let dir = std::env::temp_dir().join(format!("mh-hooks-{}-golden", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".chisel")).unwrap();
+        let out = compose_brief_with(&cfg, &dir, "explore-1", &golden_runner);
+        let want = "# Mem-Harness brief for explore-1\n\n\
+## Setup\n\
+- Not created yet here: relatum, libellus, adsertio. Call harness_init once before writing notes or claims.\n\n\
+# Libellus brief for explore-1\n\n## Current state\n- state\n\n\
+## Claims unverified or refuted\n- [unverified] c1: s\n\n\
+- chisel: chisel db locked\n\n";
+        assert_eq!(out, format!("{want}{FOOTER}"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn text_sections_come_from_config() {
+        let mut cfg = Config::builtin();
+        let spec = |name: &str, cmd: &str, gate: &str| SectionSpec {
+            name: name.into(),
+            parse: "text".into(),
+            command: cmd.into(),
+            args: vec!["for".into(), "{agent}".into()],
+            weight: 7,
+            heading: format!("## {name} heading"),
+            only_if_exists: gate.into(),
+        };
+        cfg.brief_sections = vec![
+            spec("todo", "todo-cli", ""),
+            spec("quiet", "quiet-cli", ""),
+            spec("broken", "broken-cli", ""),
+            spec("gated", "gated-cli", ".nope"),
+        ];
+        cfg.stores.clear();
+        let dir = std::env::temp_dir().join(format!("mh-hooks-{}-text", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runner = |prog: &str, a: &[&str], _: &Path, _: Duration| -> Result<CmdOut, String> {
+            assert_eq!(a, ["for", "main"]);
+            match prog {
+                "todo-cli" => ok("- one\n- two\n"),
+                "quiet-cli" => ok("  \n"),
+                "broken-cli" => Err("broken-cli not found on PATH".into()),
+                other => panic!("{other} should not run"),
+            }
+        };
+        let out = compose_brief_with(&cfg, &dir, "main", &runner);
+        assert_eq!(
+            out,
+            format!(
+                "# Mem-Harness brief for main\n\n## todo heading\n- one\n- two\n\n\
+- broken: broken-cli not found on PATH\n\n{FOOTER}"
+            )
+        );
+        let r = text_section_lines("x", "## X", fail("error: bad flag"));
+        assert_eq!(r.unwrap(), ["- x: bad flag"]);
+    }
+
+    /// A store the tool refuses is named with its reason, not offered to
+    /// harness_init.
+    #[cfg(unix)]
+    #[test]
+    fn setup_names_a_refused_store() {
+        let mut cfg = Config::builtin();
+        cfg.brief_sections.clear();
+        for s in &mut cfg.stores {
+            s.env = format!("MH_TEST_UNSET_{}", s.tool.to_uppercase());
+        }
+        let dir = std::env::temp_dir().join(format!("mh-hooks-{}-setup", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::create_dir_all(dir.join(".swarmnotes")).unwrap();
+        std::fs::create_dir_all(dir.join(".adsertio")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join(".libellus")).unwrap();
+        let out = compose_brief_with(&cfg, &dir, "main", &golden_runner);
+        assert!(!out.contains("Not created yet"), "{out}");
+        assert!(
+            out.contains("- libellus: ") && out.contains("is a symlink; libellus refuses it"),
+            "{out}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

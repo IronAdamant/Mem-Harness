@@ -54,6 +54,8 @@ Two hooks cover what was not saved:
 - **Before a compact**, the summary is asked to end with a
   `## Not yet recorded` list. After the compact those lines are saved as
   Libellus notes tagged `from-compact`, so they also reach later sessions.
+  A line saved by an earlier compact is not saved again, and one line
+  Libellus refuses does not lose the others.
 - **When a turn edits files but saves nothing**, the agent is asked once to
   save its decisions, rules or results before it stops. This costs one extra
   round trip on such turns. Turn it off with `"nudge_on_stop": false` under
