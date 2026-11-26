@@ -15,6 +15,7 @@ Usage:
   mem-harness mcp                       serve MCP on stdio (what Claude Code starts)
   mem-harness hook <event>              run a Claude Code hook; event: session-start | subagent-start
   mem-harness brief [--agent NAME]      print the merged compaction brief
+  mem-harness init                      create the Relatum, Libellus and Adsertio stores here if missing
   mem-harness ownership                 print who owns each feature and what is hidden where
   mem-harness doctor                    check config, project and every backend's binary
   mem-harness install                   print the .mcp.json entry and hook settings to paste
@@ -35,6 +36,7 @@ fn main() -> ExitCode {
         "hook" => return cmd_hook(rest),
         "brief" => cmd_brief(rest),
         "ownership" => no_args(rest).and_then(|_| cmd_ownership()),
+        "init" => no_args(rest).and_then(|_| cmd_init()),
         "doctor" => return cmd_doctor(rest),
         "install" => no_args(rest).and_then(|_| cmd_install()),
         "print-config" => no_args(rest).map(|_| print!("{}", config::DEFAULT_JSON)),
@@ -124,7 +126,54 @@ fn natives(root: &Path, cfg: &Config) -> Vec<mh_proxy::NativeTool> {
             Ok(text_result(mh_hooks::compose_brief(&brief_cfg, &brief_root, &agent)))
         }),
     };
-    vec![brief]
+    let init_root = root.to_path_buf();
+    let init = mh_proxy::NativeTool {
+        def: Value::obj(vec![
+            ("name", Value::str("harness_init")),
+            (
+                "description",
+                Value::str(
+                    "Create the Relatum, Libellus and Adsertio stores in this project if missing (one call; existing stores are never touched). Call when a note, board or claim tool says its store is missing.",
+                ),
+            ),
+            ("inputSchema", schema(vec![], &[])),
+        ]),
+        run: Arc::new(move |_args: Value| Ok(text_result(init_report(&init_root)))),
+    };
+    vec![brief, init]
+}
+
+fn init_report(root: &Path) -> String {
+    let out = mh_hooks::stores::init(root, &mh_hooks::run_command);
+    let rows: Vec<Value> = out
+        .iter()
+        .map(|(tool, outcome)| {
+            Value::obj(vec![
+                ("tool", Value::str(*tool)),
+                ("store", Value::str(outcome.clone())),
+            ])
+        })
+        .collect();
+    Value::obj(vec![
+        ("project", Value::str(root.display().to_string())),
+        ("stores", Value::Array(rows)),
+    ])
+    .to_json()
+}
+
+fn cmd_init() -> Result<(), String> {
+    let (root, _) = load()?;
+    let out = mh_hooks::stores::init(&root, &mh_hooks::run_command);
+    let mut failed = false;
+    for (tool, outcome) in &out {
+        failed |= outcome.starts_with("failed");
+        println!("{tool:<9} {outcome}");
+    }
+    if failed {
+        Err("some stores could not be created".into())
+    } else {
+        Ok(())
+    }
 }
 
 fn cmd_mcp() -> Result<(), String> {

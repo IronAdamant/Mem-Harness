@@ -3,6 +3,7 @@
 pub mod brief;
 pub mod hook;
 mod run;
+pub mod stores;
 
 pub use brief::{assemble, compose_brief, compose_brief_with, Section};
 pub use hook::run_hook;

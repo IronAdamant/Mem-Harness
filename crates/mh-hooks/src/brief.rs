@@ -343,7 +343,22 @@ pub fn compose_brief_with(cfg: &Config, project: &Path, agent: &str, run: &Runne
             j(h, "issues"),
         )
     });
-    let sections: Vec<Section> = [a, r, c, h].into_iter().flatten().collect();
+    let mut sections: Vec<Section> = Vec::new();
+    let missing = crate::stores::missing(project);
+    if !missing.is_empty() {
+        sections.push(Section::new(
+            5,
+            "harness_init",
+            vec![
+                "## Setup".to_string(),
+                format!(
+                    "- Not created yet here: {}. Call harness_init once before writing notes or claims.",
+                    missing.join(", ")
+                ),
+            ],
+        ));
+    }
+    sections.extend([a, r, c, h].into_iter().flatten());
     assemble(agent, &sections, cfg.brief.budget_chars)
 }
 
