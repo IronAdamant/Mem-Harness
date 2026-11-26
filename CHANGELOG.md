@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 Fixes from a full adversarial review (32 findings, 28 reproduced with failing tests), and room for new tools.
 
