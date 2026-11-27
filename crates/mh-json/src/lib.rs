@@ -195,9 +195,27 @@ impl std::error::Error for ParseError {}
 /// The top-level `"id"` of a JSON-RPC message that does not parse as a
 /// whole (too deep, a bad escape elsewhere), so the error can still be
 /// sent for the right request. Only a number or string id is returned; a
-/// scan that cannot follow the text returns `None`. Iterative: no depth
-/// limit is needed.
+/// scan that cannot follow the text returns `None`. See [`peek`].
 pub fn find_id(text: &str) -> Option<Value> {
+    peek(text).id
+}
+
+/// What [`peek`] could see of a message that does not parse.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Peek {
+    /// The top-level `"id"`, when it is a number or a string that parses.
+    pub id: Option<Value>,
+    /// A top-level `"method"` key was seen: the message is a request or a
+    /// notification, not a reply, so its id is the sender's own.
+    pub method: bool,
+}
+
+/// Scan the top-level keys of a JSON object that does not parse as a
+/// whole. Values are skipped, not checked, so a bad escape or deep nesting
+/// inside one does not stop the scan; text the scan cannot follow ends it
+/// with what was seen so far. Iterative: no depth limit is needed.
+pub fn peek(text: &str) -> Peek {
+    let mut out = Peek::default();
     let b = text.strip_prefix('\u{feff}').unwrap_or(text).as_bytes();
     let ws = |i: &mut usize| {
         while matches!(b.get(*i), Some(b' ' | b'\t' | b'\r' | b'\n')) {
@@ -215,54 +233,63 @@ pub fn find_id(text: &str) -> Option<Value> {
             }
         }
     };
-    let mut i = 0;
-    ws(&mut i);
-    if b.get(i) != Some(&b'{') {
-        return None;
-    }
-    i += 1;
-    loop {
+    let mut scan = || -> Option<()> {
+        let mut i = 0;
         ws(&mut i);
-        if b.get(i) != Some(&b'"') {
-            return None;
-        }
-        let key_end = string_end(i)?;
-        let key = &b[i..key_end];
-        i = key_end;
-        ws(&mut i);
-        if b.get(i) != Some(&b':') {
+        if b.get(i) != Some(&b'{') {
             return None;
         }
         i += 1;
-        ws(&mut i);
-        let start = i;
-        // Skip the value: nested brackets and strings, to the next
-        // top-level `,` or `}`.
-        let mut depth = 0usize;
         loop {
-            match *b.get(i)? {
-                b'"' => i = string_end(i)?,
-                b'{' | b'[' => {
-                    depth += 1;
-                    i += 1;
-                }
-                b'}' | b']' if depth > 0 => {
-                    depth -= 1;
-                    i += 1;
-                }
-                b',' | b'}' if depth == 0 => break,
-                _ => i += 1,
+            ws(&mut i);
+            if b.get(i) != Some(&b'"') {
+                return None;
             }
+            let key_end = string_end(i)?;
+            let key = &b[i..key_end];
+            i = key_end;
+            ws(&mut i);
+            if b.get(i) != Some(&b':') {
+                return None;
+            }
+            i += 1;
+            ws(&mut i);
+            let start = i;
+            // Skip the value: nested brackets and strings, to the next
+            // top-level `,` or `}`.
+            let mut depth = 0usize;
+            loop {
+                match *b.get(i)? {
+                    b'"' => i = string_end(i)?,
+                    b'{' | b'[' => {
+                        depth += 1;
+                        i += 1;
+                    }
+                    b'}' | b']' if depth > 0 => {
+                        depth -= 1;
+                        i += 1;
+                    }
+                    b',' | b'}' if depth == 0 => break,
+                    _ => i += 1,
+                }
+            }
+            if key == b"\"method\"" {
+                out.method = true;
+            }
+            if key == b"\"id\"" && out.id.is_none() {
+                let v = std::str::from_utf8(&b[start..i])
+                    .ok()
+                    .and_then(|t| parse(t.trim()).ok());
+                out.id = v.filter(|v| matches!(v, Value::Num(_) | Value::Str(_)));
+            }
+            if b[i] == b'}' {
+                return Some(());
+            }
+            i += 1;
         }
-        if key == b"\"id\"" {
-            let v = parse(std::str::from_utf8(&b[start..i]).ok()?.trim()).ok()?;
-            return matches!(v, Value::Num(_) | Value::Str(_)).then_some(v);
-        }
-        if b[i] == b'}' {
-            return None;
-        }
-        i += 1;
-    }
+    };
+    let _ = scan();
+    out
 }
 
 /// Parse one JSON text. A leading byte order mark is skipped: Windows

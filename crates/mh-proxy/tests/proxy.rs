@@ -1189,8 +1189,9 @@ struct Scripted {
     start_ms: u64,
     /// Starts numbered (1-based) at or below this fail.
     fail_first: u32,
-    /// When set, the first start blocks until it is opened.
+    /// When set, start number `gate_start` blocks until it is opened.
     gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+    gate_start: u32,
     /// A successful start reports ToolsChanged through this sink.
     sink: Arc<Mutex<Option<EventSink>>>,
     emit_on_start: bool,
@@ -1208,6 +1209,7 @@ impl Scripted {
             start_ms: 0,
             fail_first: 0,
             gate: None,
+            gate_start: 1,
             sink: Arc::new(Mutex::new(None)),
             emit_on_start: false,
             lists: AtomicU32::new(0),
@@ -1226,7 +1228,7 @@ impl Backend for Scripted {
     }
     fn start(&self) -> Result<(), CallError> {
         let n = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
-        if n == 1 {
+        if n == self.gate_start {
             if let Some(g) = &self.gate {
                 let mut open = g.0.lock().unwrap();
                 while !*open {
@@ -1388,6 +1390,52 @@ fn cancel_wakes_a_call_waiting_on_a_fetch() {
     // Reuse id 20 until it is answered (not -32600): the cancelled call
     // has ended while its backend is still starting.
     let deadline = Instant::now() + DEADLINE;
+    let mut id = 100;
+    loop {
+        h.send(
+            r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"harness_status"}}"#,
+        );
+        h.request(id, "ping", "{}");
+        id += 1;
+        let ok = h.lines().iter().any(|v| {
+            v.get("id").map(Value::to_json).as_deref() == Some("20") && v.get("result").is_some()
+        });
+        if ok {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the cancelled call kept waiting");
+        thread::sleep(Duration::from_millis(5));
+    }
+    gate_open(&gate);
+    h.finish();
+}
+
+/// A call to a failed backend starts it again itself; a cancel while that
+/// start hangs ends the call at once (its id can be reused), not when the
+/// start gives up.
+#[test]
+fn cancel_ends_a_call_whose_own_fetch_hangs() {
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let beta = Arc::new(Scripted {
+        fail_first: 1,
+        gate: Some(gate.clone()),
+        gate_start: 2,
+        ..Scripted::new("beta")
+    });
+    let h = start_scripted(&beta, no_timer());
+    h.init();
+    let st = status_of(&h, 1, "beta");
+    assert_eq!(st.get("state").unwrap().as_str(), Some("failed"));
+    h.send(r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"beta_echo"}}"#);
+    let deadline = Instant::now() + DEADLINE;
+    while beta.starts() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the call did not start the backend"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    h.send(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":20}}"#);
     let mut id = 100;
     loop {
         h.send(

@@ -713,12 +713,11 @@ impl Shared {
                 return Found::Unknown;
             }
             fetched = true;
-            let g = Self::begin_fetch(&mut st, i);
-            drop(st);
-            self.run_fetch(i, g, true);
-            // A newer fetch may have superseded this one; the loop waits
-            // for it.
-            st = lock(&self.state);
+            // On its own thread, so this call waits on it like any other
+            // and a cancel ends the wait at once (starting a backend can
+            // take its whole handshake limit). A newer fetch may supersede
+            // this one; the loop waits for that too.
+            self.spawn_fetch(&mut st, i, true, "call");
         }
     }
 

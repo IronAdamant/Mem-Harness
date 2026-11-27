@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+Fixes from a review of the 0.4.0 and 0.4.1 changes, each with a test that fails without it (the Linux-only one excepted).
+
+**Backends**
+- One call larger than 32 MiB to a server busy with another call no longer gets the server stopped as "not reading its stdin" at the next message: the line being written is not counted as backlog.
+- A malformed request from a server (its line has a `"method"`) no longer fails our pending call that has the same id; servers number their own requests. A malformed reply still fails its call at once.
+
+**Proxy**
+- A call that starts a failed backend itself now does so on its own thread, so a cancel ends the call at once instead of after the backend's whole handshake limit.
+
+**Hooks**
+- A third-party line made only of `-`, `=`, `*` or `_` is bracketed in the brief (`[---]`): under a line of text it made that text a Markdown heading.
+- Linux: a hook timeout takes all its process facts from one `ps` snapshot, so a process that a still-running command starts at that moment is no longer taken for an orphan and killed. Before the KILL that follows TERM, each pid is checked again: still there under the same parent, or re-parented to init or to us. A pid that exited and was reused is not sent KILL.
+
 - The stop check no longer asks to save after a turn whose only change is a `git pull`, `checkout` or `reset` to commits made earlier. `HEAD` moving now counts as an edit only when the turn made a commit. A snapshot saved by 0.4.x is not read as a baseline, so the first stop after upgrading falls back to the edit tools in the transcript.
 
 ## 0.4.1
