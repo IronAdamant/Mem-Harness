@@ -47,3 +47,30 @@ Comparing the two `pre` pairs:
 
 The v0.1.0 release notes said "17% less context at session start". That 17%
 is the drop in newly cached tokens. The whole first-turn context fell by 8%.
+
+## Re-run on 0.4.1 (2026-11-27)
+
+The same task and checkout, run again with `mem-harness` 0.4.1 and all seven
+of its hooks ([config/harness-041.settings.json](config/harness-041.settings.json)),
+against the same nine servers with their own hooks. The MCP configs need
+absolute paths: `claude` does not expand the `~` in the redacted copies here.
+Raw output: `runs/*-041.jsonl`.
+
+| Run | MCP tools offered | First-turn context (tokens) | Cost (USD) | Turns | Task done |
+|---|---|---|---|---|---|
+| nine-1-041 | 187 | 26,020 | 0.1881 | 18 | no |
+| nine-2-041 | 187 | 26,020 | 0.1816 | 20 | no |
+| harness-1-041 | 130 | 23,918 | 0.1741 | 18 | yes |
+| harness-2-041 | 130 | 23,918 | 0.1831 | 18 | yes |
+
+- First-turn context is 2,102 tokens lower with the harness (−8%), as on 0.1.0.
+  Claude Code's own share grew between the two runs (13,399 to 15,319 cached
+  tokens), so compare runs from the same day only.
+- Cost is 3% lower on average (0.1786 vs 0.1849 USD), but this is not like for
+  like. Both nine-server runs stopped short: the Libellus and Adsertio stores
+  did not exist, their `init` needs a shell command the run may not use, and
+  the private note and the claim were never written. Both harness runs created
+  the stores with `harness_init` and did all five steps.
+- The 12% saving measured on 0.1.0 did not hold. Read the harness's gain as the
+  task being finished in a fresh project at about the same cost, and 30% fewer
+  tools in context.
