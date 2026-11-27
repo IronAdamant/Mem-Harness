@@ -8,6 +8,12 @@ Fixes from a review of the 0.4.0 and 0.4.1 changes, each with a test that fails 
 - One call larger than 32 MiB to a server busy with another call no longer gets the server stopped as "not reading its stdin" at the next message: the line being written is not counted as backlog.
 - A malformed request from a server (its line has a `"method"`) no longer fails our pending call that has the same id; servers number their own requests. A malformed reply still fails its call at once.
 
+**From a stress run on real repositories** (linux, llvm-project, rust, and about 30 smaller sample projects)
+- A request longer than the 64 MiB line limit is answered with its own id (read from the line's start), not `null`, so the client stops waiting.
+- A call cut short because the harness is shutting down says so, instead of advising to install the backend.
+- PostCompact still saves at most 20 "not yet recorded" items, but now reports how many more it left out.
+- The stop check reads transcript lines written with spaces after the colons (`"type": "user"`).
+
 **Proxy**
 - A call that starts a failed backend itself now does so on its own thread, so a cancel ends the call at once instead of after the backend's whole handshake limit.
 

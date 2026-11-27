@@ -1174,7 +1174,9 @@ fn over_long_line_is_skipped() {
     assert_eq!(out.len(), 2, "{out:?}");
     let e = out[0].get("error").unwrap();
     assert_eq!(e.get("code").unwrap().as_i64(), Some(-32700));
-    assert!(out[0].get("id").unwrap().is_null());
+    // Answered with its own id (found in the line's start), so the client
+    // is not left waiting.
+    assert_eq!(out[0].get("id").unwrap().to_json(), "1");
     assert_eq!(out[1].get("id").unwrap().to_json(), "2");
 }
 

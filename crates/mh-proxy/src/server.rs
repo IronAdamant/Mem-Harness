@@ -219,8 +219,10 @@ pub fn run<R: BufRead, W: Write + Send + 'static>(
             Ok(Line::Eof) => break,
             Ok(Line::Read) => {}
             Ok(Line::TooLong) => {
+                // The id is found in the line's start, when it is there.
+                let id = mh_json::find_id(&String::from_utf8_lossy(&buf)).unwrap_or(Value::Null);
                 shared.send_error(
-                    Value::Null,
+                    id,
                     PARSE_ERROR,
                     format!("parse error: message longer than {MAX_LINE} bytes; skipped"),
                     None,
@@ -323,6 +325,10 @@ fn content_len(line: &[u8]) -> usize {
 /// Read one line into `buf`, keeping it when its content (not counting the
 /// `\n` or `\r\n` that ends it) is at most `cap` bytes: a longer line is
 /// read to its end and dropped, without buffering it.
+/// How much of an over-long line is kept (in `buf`) after
+/// [`read_line_capped`] returns `TooLong`: enough to find its id.
+const TOO_LONG_PREFIX: usize = 64 * 1024;
+
 fn read_line_capped<R: BufRead>(r: &mut R, buf: &mut Vec<u8>, cap: usize) -> io::Result<Line> {
     buf.clear();
     // Room for the content plus a two-byte terminator.
@@ -330,7 +336,7 @@ fn read_line_capped<R: BufRead>(r: &mut R, buf: &mut Vec<u8>, cap: usize) -> io:
     let mut over = false;
     let finish = |over: bool, buf: &mut Vec<u8>| {
         if over || content_len(buf) > cap {
-            buf.clear();
+            buf.truncate(TOO_LONG_PREFIX);
             Line::TooLong
         } else {
             Line::Read
@@ -355,9 +361,13 @@ fn read_line_capped<R: BufRead>(r: &mut R, buf: &mut Vec<u8>, cap: usize) -> io:
             };
             if !over {
                 if buf.len() + chunk.len() > keep {
+                    // Keep the start, where the id usually is, so the
+                    // error can answer the right request.
                     over = true;
-                    buf.clear();
-                    buf.shrink_to(0);
+                    let room = TOO_LONG_PREFIX.saturating_sub(buf.len());
+                    buf.extend_from_slice(&chunk[..room.min(chunk.len())]);
+                    buf.truncate(TOO_LONG_PREFIX);
+                    buf.shrink_to_fit();
                 } else {
                     buf.extend_from_slice(chunk);
                 }
@@ -1081,6 +1091,12 @@ impl Shared {
                         message,
                         data,
                     }) => Reply::Error(code, message, data),
+                    Err(CallError::Unavailable(why)) if self.closing.load(Ordering::SeqCst) => {
+                        Reply::Result(text::text_result(
+                            text::shutting_down(name, b.name(), &why),
+                            true,
+                        ))
+                    }
                     Err(CallError::Unavailable(why)) => Reply::Result(text::text_result(
                         text::unavailable(name, b.name(), &why),
                         true,
@@ -1256,6 +1272,30 @@ mod tests {
             }
         }
         assert_eq!(got, ["ab\n", "<too long>", "abcd\n", "\n", "xyz"]);
+    }
+
+    /// An over-long line leaves its start in `buf`, so its id can be
+    /// answered; the next line reads normally.
+    #[test]
+    fn too_long_keeps_the_start_for_the_id() {
+        let big = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":42,\"params\":\"{}\"}}\n{{\"id\":1}}\n",
+            "x".repeat(3 * TOO_LONG_PREFIX)
+        );
+        let mut r = BufReader::with_capacity(1000, big.as_bytes());
+        let mut buf = Vec::new();
+        assert!(matches!(
+            read_line_capped(&mut r, &mut buf, 2 * TOO_LONG_PREFIX).unwrap(),
+            Line::TooLong
+        ));
+        assert_eq!(buf.len(), TOO_LONG_PREFIX);
+        let id = mh_json::find_id(&String::from_utf8_lossy(&buf));
+        assert_eq!(id, Some(Value::Num("42".into())));
+        assert!(matches!(
+            read_line_capped(&mut r, &mut buf, 2 * TOO_LONG_PREFIX).unwrap(),
+            Line::Read
+        ));
+        assert_eq!(buf, b"{\"id\":1}\n");
     }
 
     fn read_all(text: &[u8], capacity: usize, cap: usize) -> Vec<String> {

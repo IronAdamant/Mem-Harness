@@ -216,9 +216,6 @@ pub fn unrecorded_items(summary: &str) -> Vec<(String, String)> {
             continue;
         }
         out.push((kind, clip(text, MAX_SUMMARY)));
-        if out.len() == MAX_ITEMS {
-            break;
-        }
     }
     out
 }
@@ -461,6 +458,10 @@ pub fn post_compact(
         seen.push(s.clone());
         new
     });
+    // At most MAX_ITEMS notes per compaction; the rest are named in the
+    // report, not dropped without a word.
+    let over = items.len().saturating_sub(MAX_ITEMS);
+    items.truncate(MAX_ITEMS);
     if items.is_empty() {
         return Ok(String::new());
     }
@@ -468,7 +469,7 @@ pub fn post_compact(
     if !crate::stores::exists(project, &store) {
         return Ok(format!(
             "{} unrecorded item(s) not saved: no Libellus store here (run mem-harness init)",
-            items.len()
+            items.len() + over
         ));
     }
     let timeout = Duration::from_secs(cfg.brief.command_timeout_s.max(1));
@@ -542,6 +543,11 @@ pub fn post_compact(
     }
     if let Some((n, e)) = skipped {
         report.push(format!("{n} item(s) not saved: {e}"));
+    }
+    if over > 0 {
+        report.push(format!(
+            "{over} more item(s) not saved: at most {MAX_ITEMS} are saved per compaction"
+        ));
     }
     Ok(report.join("; "))
 }
@@ -667,8 +673,8 @@ pub fn last_turn(jsonl: &str, brief: &BriefConfig) -> Turn {
         ..Turn::default()
     };
     for line in jsonl.lines() {
-        let is_user = line.contains("\"type\":\"user\"");
-        if !is_user && !line.contains("\"type\":\"assistant\"") {
+        // A cheap filter before parsing; any spacing around the colon.
+        if !line.contains("\"user\"") && !line.contains("\"assistant\"") {
             continue;
         }
         let Ok(v) = mh_json::parse(line) else {
@@ -886,7 +892,7 @@ mod tests {
             .join("\n");
         assert_eq!(
             unrecorded_items(&format!("{UNRECORDED_HEADING}\n{many}")).len(),
-            MAX_ITEMS
+            40
         );
     }
 
