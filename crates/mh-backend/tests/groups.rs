@@ -1,7 +1,10 @@
 //! Process groups, status ordering, cancel during startup and the last
-//! reply before an exit (from the second adversarial review), against tiny
-//! `/bin/sh` servers. Unix only. Thread and CPU counts are in `threads.rs`.
-#![cfg(unix)]
+//! reply before an exit (from the second adversarial review). On Unix the
+//! servers are tiny `/bin/sh` scripts; on Windows the same steps are run by
+//! `mh-fake-mcp script` (see that binary), and the "process group" is the
+//! job object the backend puts each server in. Each test names both
+//! servers and the test body is shared. Thread and CPU counts are in
+//! `threads.rs`.
 
 use mh_backend::stdio::{Limits, StdioBackend, MAX_BACKLOG};
 use mh_backend::{Backend, BackendEvent, CallError, CancelToken, EventSink};
@@ -15,6 +18,9 @@ use std::time::{Duration, Instant};
 
 static DIRS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(windows)]
+const FAKE: &str = env!("CARGO_BIN_EXE_mh-fake-mcp");
+
 fn dir(tag: &str) -> PathBuf {
     let n = DIRS.fetch_add(1, Ordering::SeqCst);
     let d = std::env::temp_dir().join(format!("mh-groups-{tag}-{}-{n}", std::process::id()));
@@ -24,7 +30,11 @@ fn dir(tag: &str) -> PathBuf {
 }
 
 /// Answers `initialize` with whatever id it carries, reads `initialized`.
+#[cfg(unix)]
 const HS: &str = r#"read l; id=$(printf '%s' "$l" | sed 's/.*"id":\([0-9]*\).*/\1/'); printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"; read l; "#;
+/// Unused off Unix: the Windows steps say `hs` instead.
+#[cfg(not(unix))]
+const HS: &str = "";
 
 fn limits() -> Limits {
     Limits {
@@ -36,25 +46,51 @@ fn limits() -> Limits {
     }
 }
 
-fn spec_in(d: &Path, script: &str) -> BackendSpec {
-    let script = script.replace("$DIR", &d.display().to_string());
-    BackendSpec::stdio("sh", "/bin/sh", &["-c", &script])
+/// The server: `unix` (a `/bin/sh` script) or `windows` (`mh-fake-mcp
+/// script` steps); `$DIR` in either is the test's folder.
+fn spec_in(d: &Path, unix: &str, windows: &[&str]) -> BackendSpec {
+    let fill = |s: &str| s.replace("$DIR", &d.display().to_string());
+    #[cfg(unix)]
+    {
+        let _ = windows;
+        BackendSpec::stdio("sh", "/bin/sh", &["-c", &fill(unix)])
+    }
+    #[cfg(windows)]
+    {
+        let _ = unix;
+        let mut args = vec!["script".to_string()];
+        args.extend(windows.iter().map(|s| fill(s)));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        BackendSpec::stdio("sh", FAKE, &args)
+    }
 }
 
-fn sh_with(tag: &str, script: &str, l: Limits, sink: EventSink) -> (StdioBackend, PathBuf) {
+fn sh_with(
+    tag: &str,
+    unix: &str,
+    windows: &[&str],
+    l: Limits,
+    sink: EventSink,
+) -> (StdioBackend, PathBuf) {
     let d = dir(tag);
-    let b = StdioBackend::new(&spec_in(&d, script), vec![], &d, sink).with_limits(l);
+    let b = StdioBackend::new(&spec_in(&d, unix, windows), vec![], &d, sink).with_limits(l);
     (b, d)
 }
 
-fn sh(tag: &str, script: &str, l: Limits) -> (StdioBackend, PathBuf) {
-    sh_with(tag, script, l, Arc::new(|_, _| {}))
+fn sh(tag: &str, unix: &str, windows: &[&str], l: Limits) -> (StdioBackend, PathBuf) {
+    sh_with(tag, unix, windows, l, Arc::new(|_, _| {}))
 }
 
 fn call(b: &StdioBackend) -> Result<Value, CallError> {
     b.call_tool("x", Value::obj(vec![]), None, &CancelToken::new())
 }
 
+/// Unix prints `exit status: N`, Windows `exit code: N`.
+fn exited_with(e: &str, code: i32) -> bool {
+    e.contains(&format!("exit status: {code}")) || e.contains(&format!("exit code: {code}"))
+}
+
+#[cfg(unix)]
 fn alive(pid: &str) -> bool {
     std::process::Command::new("kill")
         .args(["-0", pid])
@@ -62,6 +98,31 @@ fn alive(pid: &str) -> bool {
         .status()
         .unwrap()
         .success()
+}
+
+#[cfg(windows)]
+fn alive(pid: &str) -> bool {
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
+}
+
+/// Clean up a process a test left running (whatever the test's outcome).
+fn kill(pid: &str) {
+    #[cfg(unix)]
+    let _ = std::process::Command::new("kill")
+        .args(["-9", pid])
+        .stderr(std::process::Stdio::null())
+        .status();
+    #[cfg(windows)]
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/PID", pid])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 /// Wait for `file` and return its trimmed text.
@@ -95,7 +156,20 @@ fn a_late_end_of_an_old_connection_keeps_the_newer_status() {
     let script = format!(
         r#"if [ -e $DIR/ran ]; then echo SECOND-START-FAILED >&2; exit 7; fi; touch $DIR/ran; {HS}read l; sleep 4 >/dev/null & echo FIRST-EXIT >&2; exit 3"#
     );
-    let (b, _d) = sh("stale", &script, limits());
+    let (b, _d) = sh(
+        "stale",
+        &script,
+        &[
+            "exit-if:7:SECOND-START-FAILED:$DIR/ran",
+            "touch:$DIR/ran",
+            "hs",
+            "read",
+            "spawn:4000:e:bg:-",
+            "eprint:FIRST-EXIT",
+            "exit:3",
+        ],
+        limits(),
+    );
     let b = Arc::new(b);
     b.start().unwrap();
     let b2 = b.clone();
@@ -119,7 +193,12 @@ fn cancel_is_honoured_while_starting() {
         handshake: Duration::from_secs(3),
         ..limits()
     };
-    let (b, _d) = sh("cstart", &format!("sleep 1; {HS}exec sleep 30"), l);
+    let (b, _d) = sh(
+        "cstart",
+        &format!("sleep 1; {HS}exec sleep 30"),
+        &["sleep:1000", "hs", "sleep:30000"],
+        l,
+    );
     let b = Arc::new(b);
     let token = CancelToken::new();
     let (b2, t2) = (b.clone(), token.clone());
@@ -146,33 +225,42 @@ fn cancel_is_honoured_while_starting() {
 #[test]
 fn shutdown_stops_the_server_behind_a_wrapper() {
     let script = format!("{HS}sh -c 'echo $$ > $DIR/pid; exec sleep 30' ; true");
-    let (b, d) = sh("orphan", &script, limits());
+    let (b, d) = sh(
+        "orphan",
+        &script,
+        &["hs", "spawn:30000:oe:wait:$DIR/pid"],
+        limits(),
+    );
     b.start().unwrap();
     let pid = read_pid(&d.join("pid"));
     b.shutdown();
     let survived = !gone_within(&pid, Duration::from_millis(500));
-    let _ = std::process::Command::new("kill").arg(&pid).status();
+    kill(&pid);
     assert!(!survived, "server pid {pid} survived shutdown");
 }
 
 /// When the server exits on its own, what it started goes too, even a
-/// process that ignores TERM (KILL after the grace).
+/// process that ignores TERM (KILL after the grace). Windows has no TERM:
+/// there the whole job is ended at once.
 #[test]
 fn an_exit_stops_the_rest_of_the_group() {
     let script =
         format!("{HS}sh -c 'trap \"\" TERM; echo $$ > $DIR/pid; exec sleep 30' & read l; exit 3");
-    let (b, d) = sh("exitgroup", &script, limits());
+    let (b, d) = sh(
+        "exitgroup",
+        &script,
+        &["hs", "spawn:30000:oe:bg:$DIR/pid", "read", "exit:3"],
+        limits(),
+    );
     b.start().unwrap();
     let pid = read_pid(&d.join("pid"));
     let r = call(&b);
     assert!(
-        matches!(&r, Err(CallError::Unavailable(e)) if e.contains("exit status: 3")),
+        matches!(&r, Err(CallError::Unavailable(e)) if exited_with(e, 3)),
         "{r:?}"
     );
     let survived = !gone_within(&pid, Duration::from_secs(2));
-    let _ = std::process::Command::new("kill")
-        .args(["-9", &pid])
-        .status();
+    kill(&pid);
     assert!(!survived, "pid {pid} outlived the server");
 }
 
@@ -183,6 +271,7 @@ fn keep_children_leaves_them_running() {
     let mut spec = spec_in(
         &d,
         &format!("{HS}sh -c 'echo $$ > $DIR/pid; exec sleep 30' >/dev/null 2>&1 </dev/null & read l; exit 3"),
+        &["hs", "spawn:30000::bg:$DIR/pid", "read", "exit:3"],
     );
     spec.keep_children = true;
     let b = StdioBackend::new(&spec, vec![], &d, Arc::new(|_, _| {})).with_limits(limits());
@@ -191,7 +280,7 @@ fn keep_children_leaves_them_running() {
     b.shutdown();
     thread::sleep(Duration::from_millis(800));
     let lived = alive(&pid);
-    let _ = std::process::Command::new("kill").arg(&pid).status();
+    kill(&pid);
     assert!(lived, "keep_children: pid {pid} was stopped");
 }
 
@@ -202,7 +291,12 @@ fn a_big_reply_just_before_exit_arrives() {
     let script = format!(
         r#"{HS}read l; id=$(printf '%s' "$l" | sed 's/.*"id":\([0-9]*\).*/\1/'); printf '{{"jsonrpc":"2.0","id":%s,"result":{{"x":[' "$id"; yes 1, | head -n 10000000 | tr -d '\n'; printf '1]}}}}\n'; exit 0"#
     );
-    let (b, _d) = sh("bigexit", &script, limits());
+    let (b, _d) = sh(
+        "bigexit",
+        &script,
+        &["hs", "read", "bigreply:10000000", "exit:0"],
+        limits(),
+    );
     b.start().unwrap();
     let t0 = Instant::now();
     match call(&b) {
@@ -230,7 +324,19 @@ fn a_reply_behind_a_slow_sink_arrives() {
             thread::sleep(Duration::from_millis(1500));
         }
     });
-    let (b, _d) = sh_with("slowsink", &script, limits(), sink);
+    let (b, _d) = sh_with(
+        "slowsink",
+        &script,
+        &[
+            "hs",
+            "read",
+            r#"print:{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":1,"progress":1}}"#,
+            r#"print:{"jsonrpc":"2.0","id":$ID,"result":{"ok":true}}"#,
+            "exit:0",
+        ],
+        limits(),
+        sink,
+    );
     b.start().unwrap();
     let r = call(&b).unwrap();
     assert_eq!(r.get("ok"), Some(&Value::Bool(true)));
@@ -244,12 +350,14 @@ fn initialize_is_never_cancelled() {
         handshake: Duration::from_millis(400),
         ..limits()
     };
-    // A background `cat` logs everything written to stdin until it closes;
-    // with `keep_children` it outlives the kill of the shell.
+    // A background `cat` (Windows: `tee`) logs everything written to stdin
+    // until it closes; with `keep_children` it outlives the kill of the
+    // server.
     let d = dir("noinitcancel");
     let mut spec = spec_in(
         &d,
         "exec 3<&0; (cat <&3; echo eof) >> $DIR/in & exec sleep 30",
+        &["tee:$DIR/in", "sleep:30000"],
     );
     spec.keep_children = true;
     let b = StdioBackend::new(&spec, vec![], &d, Arc::new(|_, _| {})).with_limits(l);
@@ -290,7 +398,13 @@ fn a_server_that_stops_reading_is_stopped() {
             ex.lock().unwrap().push(why);
         }
     });
-    let (b, _d) = sh_with("backlog", &format!("{HS}exec sleep 30"), l, sink);
+    let (b, _d) = sh_with(
+        "backlog",
+        &format!("{HS}exec sleep 30"),
+        &["hs", "sleep:30000"],
+        l,
+        sink,
+    );
     b.start().unwrap();
     let arg = Value::obj(vec![("blob", Value::str("a".repeat(1 << 20)))]);
     let stopped = || {

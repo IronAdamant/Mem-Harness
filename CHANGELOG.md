@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.1
+
+Windows test coverage. No change to the harness itself.
+
+- The process and pipe edge-case tests (`pipes.rs`, `groups.rs`, `threads.rs` in `mh-backend`) ran only on Unix. They now run on Windows too: each test names its `/bin/sh` server and the same steps for a new `mh-fake-mcp script` mode, and the test body is shared. On Windows they exercise the job object that stands in for a process group: shutdown behind a wrapper, an exit stopping what the server started, `keep_children`, a grandchild holding stdout or stderr, a stalled writer, the backlog limit, thread leaks and idle CPU. The Unix servers are unchanged.
+- Two `mh-proxy` tests read a backend's status before its failing first start had finished and failed about one run in five on Windows under a parallel load. They now wait for the `failed` state (`harness_status` does not wait for a start, by design).
+
 ## 0.5.0
 
 **Backend stores no longer go in the repository.** Opening a repository used to leave `.stele-context`, `.chisel`, `.coordinationhub` and, after a Trammel call, `.trammel` in it, untracked and easy to commit. Now the harness points each of those tools at a folder outside the project, using the setting the tool already reads:

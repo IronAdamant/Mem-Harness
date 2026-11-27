@@ -1,5 +1,6 @@
-//! A fake stdio MCP server for mh-backend's tests (std and mh-json only).
-//! Not part of the harness.
+//! A fake stdio MCP server for mh-backend's tests (std, mh-json and mh-sys
+//! only). Not part of the harness. `mh-fake-mcp script <step>...` is a
+//! second mode: see [`script`].
 //!
 //! Environment:
 //! - `FAKE_LOG=<file>`: append every line received.
@@ -104,7 +105,266 @@ struct PingWait {
     other: Option<Value>,
 }
 
+/// The first `"id":<digits>` in a line (what the `/bin/sh` test servers
+/// extract with `sed`), or `0`.
+fn line_id(line: &str) -> String {
+    numeric_id(line).unwrap_or_else(|| "0".into())
+}
+
+fn numeric_id(line: &str) -> Option<String> {
+    let (_, rest) = line.split_once("\"id\":")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    (!digits.is_empty()).then_some(digits)
+}
+
+fn read_line(stdin: &mut std::io::StdinLock<'_>) -> Option<String> {
+    let mut l = String::new();
+    match stdin.read_line(&mut l) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(l),
+    }
+}
+
+fn write_raw(to: &mut dyn Write, bytes: &[u8]) {
+    let _ = to.write_all(bytes);
+    let _ = to.flush();
+}
+
+/// `n` copies of `unit`, written in chunks.
+fn write_repeat(to: &mut dyn Write, unit: &[u8], n: usize) {
+    let per = (1 << 16) / unit.len().max(1) + 1;
+    let chunk = unit.repeat(per);
+    let mut left = n;
+    while left > 0 {
+        let k = left.min(per);
+        if to.write_all(&chunk[..k * unit.len()]).is_err() {
+            return;
+        }
+        left -= k;
+    }
+    let _ = to.flush();
+}
+
+/// `mh-fake-mcp sleep <ms> <pidfile|->`: write our pid (and a newline) to
+/// `pidfile`, then sleep. A stand-in for the `sleep` a test server leaves
+/// running.
+fn child_sleep(args: &[String]) -> ! {
+    let ms: u64 = args.first().and_then(|s| s.parse().ok()).unwrap_or(30_000);
+    if let Some(file) = args.get(1).filter(|f| *f != "-") {
+        let _ = std::fs::write(file, format!("{}\n", std::process::id()));
+    }
+    thread::sleep(Duration::from_millis(ms));
+    std::process::exit(0)
+}
+
+/// `mh-fake-mcp tee <file>`: append everything read from stdin to `file`,
+/// then `eof` once stdin closes.
+fn child_tee(args: &[String]) -> ! {
+    use std::io::Read;
+    let Some(file) = args.first() else {
+        std::process::exit(2)
+    };
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file)
+        .unwrap();
+    let mut buf = [0u8; 8192];
+    let mut stdin = std::io::stdin().lock();
+    loop {
+        match stdin.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let _ = f.write_all(&buf[..n]);
+                let _ = f.flush();
+            }
+        }
+    }
+    let _ = writeln!(f, "eof");
+    std::process::exit(0)
+}
+
+/// `mh-fake-mcp script <step>...`: a server that does exactly the steps
+/// given, in order, for tests of pipe and process edge cases on any OS (on
+/// Unix those tests use tiny `/bin/sh` servers instead). `$ID` in a text is
+/// the id of the last line read. Steps:
+///
+/// - `hs`: read `initialize`, answer it, read `initialized`.
+/// - `read`: read one line.
+/// - `print:<text>` / `eprint:<text>`: write a line to stdout / stderr.
+/// - `sleep:<ms>`, `exit:<code>`, `touch:<path>`.
+/// - `exit-if:<code>:<msg>:<path>`: when `path` exists, print `msg` to
+///   stderr and exit with `code`.
+/// - `spawn:<ms>:<io>:<wait|bg>:<pidfile|->`: start `sleep <ms>` (see
+///   above) with stdin closed, keeping our stdout when `io` has `o` and our
+///   stderr when it has `e`; `wait` waits for it, `bg` goes on.
+/// - `tee:<file>`: start `tee <file>` reading our stdin, and go on.
+/// - `bigline:<n>`: a reply with id 2 whose string result is `n` bytes.
+/// - `bigerr:<n>`: a stderr line of `n` bytes.
+/// - `bigreply:<n>`: a reply to `$ID` whose `x` is an array of `n + 1` ones.
+/// - `pings:<n>`: `n` ping requests with ids `p0`, `p1`, ...
+/// - `serial`: from here on read one line at a time and answer each line
+///   with an id with `{}`, after 2 s when it calls the tool `a`.
+// `spawn:..:bg` and `tee` leave their child running on purpose: what
+// happens to it is what the tests check.
+#[allow(clippy::zombie_processes)]
+fn script(steps: &[String]) -> ! {
+    // Windows: a child is handed every inheritable handle, so without this
+    // a `spawn` with stdout closed would still hold our stdout pipe, unlike
+    // `sleep >/dev/null &` in the `/bin/sh` servers these steps stand in for.
+    // The handles a `spawn` keeps are passed explicitly, so they still work.
+    mh_sys::stop_std_inheritance();
+    let me = std::env::current_exe().unwrap();
+    let mut stdin = std::io::stdin().lock();
+    let mut out = std::io::stdout().lock();
+    let mut err = std::io::stderr().lock();
+    let mut id = String::from("0");
+    for step in steps {
+        let (name, arg) = step.split_once(':').unwrap_or((step.as_str(), ""));
+        match name {
+            "hs" => {
+                let Some(l) = read_line(&mut stdin) else {
+                    break;
+                };
+                id = line_id(&l);
+                write_raw(
+                    &mut out,
+                    format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{}}}}\n").as_bytes(),
+                );
+                if read_line(&mut stdin).is_none() {
+                    break;
+                }
+            }
+            "read" => {
+                let Some(l) = read_line(&mut stdin) else {
+                    break;
+                };
+                id = line_id(&l);
+            }
+            "print" => write_raw(
+                &mut out,
+                format!("{}\n", arg.replace("$ID", &id)).as_bytes(),
+            ),
+            "eprint" => write_raw(
+                &mut err,
+                format!("{}\n", arg.replace("$ID", &id)).as_bytes(),
+            ),
+            "sleep" => thread::sleep(Duration::from_millis(arg.parse().unwrap())),
+            "exit" => std::process::exit(arg.parse().unwrap()),
+            "touch" => {
+                let _ = std::fs::write(arg, "");
+            }
+            "exit-if" => {
+                // <code>:<msg>:<path>; the path is last as it may hold a drive colon.
+                let mut it = arg.splitn(3, ':');
+                let (code, msg, path) =
+                    (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
+                if std::path::Path::new(path).exists() {
+                    write_raw(&mut err, format!("{msg}\n").as_bytes());
+                    std::process::exit(code.parse().unwrap());
+                }
+            }
+            "spawn" => {
+                // <ms>:<io>:<wait|bg>:<pidfile|->; the pidfile is last (drive colon).
+                let mut it = arg.splitn(4, ':');
+                let (ms, io, mode, pidfile) = (
+                    it.next().unwrap(),
+                    it.next().unwrap(),
+                    it.next().unwrap(),
+                    it.next().unwrap(),
+                );
+                let mut c = std::process::Command::new(&me);
+                c.args(["sleep", ms, pidfile])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(if io.contains('o') {
+                        std::process::Stdio::inherit()
+                    } else {
+                        std::process::Stdio::null()
+                    })
+                    .stderr(if io.contains('e') {
+                        std::process::Stdio::inherit()
+                    } else {
+                        std::process::Stdio::null()
+                    });
+                let mut child = c.spawn().unwrap();
+                if mode == "wait" {
+                    let _ = child.wait();
+                }
+            }
+            "tee" => {
+                std::process::Command::new(&me)
+                    .args(["tee", arg])
+                    .stdin(std::process::Stdio::inherit())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap();
+            }
+            "bigline" => {
+                write_raw(
+                    &mut out,
+                    b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"x\":\"",
+                );
+                write_repeat(&mut out, b"a", arg.parse().unwrap());
+                write_raw(&mut out, b"\"}}\n");
+            }
+            "bigerr" => {
+                write_repeat(&mut err, b"e", arg.parse().unwrap());
+                write_raw(&mut err, b"\n");
+            }
+            "bigreply" => {
+                write_raw(
+                    &mut out,
+                    format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"x\":[").as_bytes(),
+                );
+                write_repeat(&mut out, b"1,", arg.parse().unwrap());
+                write_raw(&mut out, b"1]}}\n");
+            }
+            "pings" => {
+                let n: usize = arg.parse().unwrap();
+                for i in 0..n {
+                    let _ = writeln!(
+                        out,
+                        "{{\"jsonrpc\":\"2.0\",\"id\":\"p{i}\",\"method\":\"ping\"}}"
+                    );
+                }
+                let _ = out.flush();
+            }
+            "serial" => {
+                while let Some(l) = read_line(&mut stdin) {
+                    // Like the Perl server it stands in for: a line without
+                    // a numeric id (a notification) gets no answer.
+                    let Some(lid) = numeric_id(&l) else { continue };
+                    if l.contains("\"name\":\"a\"") {
+                        thread::sleep(Duration::from_secs(2));
+                    }
+                    write_raw(
+                        &mut out,
+                        format!("{{\"jsonrpc\":\"2.0\",\"id\":{lid},\"result\":{{}}}}\n")
+                            .as_bytes(),
+                    );
+                }
+            }
+            other => {
+                write_raw(
+                    &mut err,
+                    format!("fake script: unknown step {other}\n").as_bytes(),
+                );
+                std::process::exit(99);
+            }
+        }
+    }
+    std::process::exit(0)
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("script") => script(&args[1..]),
+        Some("sleep") => child_sleep(&args[1..]),
+        Some("tee") => child_tee(&args[1..]),
+        _ => {}
+    }
     if let Ok(msg) = std::env::var("FAKE_STARTUP_EXIT") {
         eprintln!("{msg}");
         std::process::exit(2);

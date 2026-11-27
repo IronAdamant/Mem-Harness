@@ -1,6 +1,6 @@
 //! Thread and CPU use of the whole test process, so these run one at a
-//! time in their own test binary. Unix only.
-#![cfg(unix)]
+//! time in their own test binary. Unix reads them from `/proc` or `ps`,
+//! Windows from PowerShell (about 300 ms a reading).
 
 use mh_backend::stdio::{Limits, StdioBackend};
 use mh_backend::{Backend, CancelToken};
@@ -23,7 +23,28 @@ fn dir(tag: &str) -> std::path::PathBuf {
     d
 }
 
+#[cfg(unix)]
 const HS: &str = r#"read l; id=$(printf '%s' "$l" | sed 's/.*"id":\([0-9]*\).*/\1/'); printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"; read l; "#;
+
+/// Windows: `field` (`Threads.Count`, `TotalProcessorTime.TotalSeconds`) of
+/// this process, from .NET through PowerShell.
+#[cfg(windows)]
+fn this_process(field: &str) -> f64 {
+    let script = format!(
+        // Invariant culture: a decimal point, not a comma, whatever the locale.
+        "[Diagnostics.Process]::GetProcessById({}).{field}.ToString([Globalization.CultureInfo]::InvariantCulture)",
+        std::process::id()
+    );
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    s.parse()
+        .unwrap_or_else(|_| panic!("powershell gave {s:?} for {field}"))
+}
 
 fn limits() -> Limits {
     Limits {
@@ -36,6 +57,7 @@ fn limits() -> Limits {
 }
 
 /// Threads in this process.
+#[cfg(unix)]
 fn threads() -> usize {
     if let Ok(rd) = std::fs::read_dir("/proc/self/task") {
         return rd.count();
@@ -45,6 +67,12 @@ fn threads() -> usize {
         .output()
         .unwrap();
     String::from_utf8_lossy(&out.stdout).lines().count() - 1
+}
+
+/// Threads in this process.
+#[cfg(windows)]
+fn threads() -> usize {
+    this_process("Threads.Count") as usize
 }
 
 /// The thread count once it has stopped falling (up to 3 s).
@@ -88,8 +116,17 @@ fn plain_restarts_do_not_leak_threads() {
 fn a_grandchild_holding_the_pipes_does_not_leak_threads() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let d = dir("grand");
-    let script = format!("{HS}sleep 60 & read l; exit 3");
-    let spec = BackendSpec::stdio("sh", "/bin/sh", &["-c", &script]);
+    #[cfg(unix)]
+    let spec = {
+        let script = format!("{HS}sleep 60 & read l; exit 3");
+        BackendSpec::stdio("sh", "/bin/sh", &["-c", &script])
+    };
+    #[cfg(windows)]
+    let spec = BackendSpec::stdio(
+        "sh",
+        FAKE,
+        &["script", "hs", "spawn:60000:oe:bg:-", "read", "exit:3"],
+    );
     let b = StdioBackend::new(&spec, vec![], &d, Arc::new(|_, _| {})).with_limits(limits());
     b.start().unwrap();
     let before = settle();
@@ -111,6 +148,9 @@ fn idle_cpu_of_nine_backends() {
     for b in &backends {
         b.start().unwrap();
     }
+    #[cfg(windows)]
+    let cpu = || this_process("TotalProcessorTime.TotalSeconds");
+    #[cfg(unix)]
     let cpu = || {
         let out = std::process::Command::new("ps")
             .args(["-o", "time=", "-p", &std::process::id().to_string()])

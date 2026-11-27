@@ -1,6 +1,7 @@
 //! Regression tests for pipe and process edge cases (from an adversarial
-//! review), against tiny `/bin/sh` servers. Unix only.
-#![cfg(unix)]
+//! review). On Unix the servers are tiny `/bin/sh` scripts; on Windows the
+//! same steps are run by `mh-fake-mcp script` (see that binary), so each
+//! test names both and the test body is shared.
 
 use mh_backend::stdio::{Limits, StdioBackend};
 use mh_backend::{Backend, CallError, CancelToken, EventSink};
@@ -15,16 +16,38 @@ static DIRS: AtomicUsize = AtomicUsize::new(0);
 
 /// Reply to `initialize` with the id it carries (a restarted server gets a
 /// new one) and read `notifications/initialized`.
+#[cfg(unix)]
 const HANDSHAKE: &str = r#"read l; id=$(printf '%s' "$l" | sed 's/.*"id":\([0-9]*\).*/\1/'); printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"; read l; "#;
 
-fn sh(tag: &str, script: &str, limits: Limits) -> StdioBackend {
+#[cfg(windows)]
+const FAKE: &str = env!("CARGO_BIN_EXE_mh-fake-mcp");
+
+/// A server that does the handshake, then `unix` (a `/bin/sh` script) or
+/// `windows` (`mh-fake-mcp script` steps).
+fn sh(tag: &str, unix: &str, windows: &[&str], limits: Limits) -> StdioBackend {
     let n = DIRS.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("mh-pipes-{tag}-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let script = format!("{HANDSHAKE}{script}");
-    let spec = BackendSpec::stdio("sh", "/bin/sh", &["-c", &script]);
+    #[cfg(unix)]
+    let spec = {
+        let _ = windows;
+        let script = format!("{HANDSHAKE}{unix}");
+        BackendSpec::stdio("sh", "/bin/sh", &["-c", &script])
+    };
+    #[cfg(windows)]
+    let spec = {
+        let _ = unix;
+        let mut args = vec!["script", "hs"];
+        args.extend_from_slice(windows);
+        BackendSpec::stdio("sh", FAKE, &args)
+    };
     let sink: EventSink = Arc::new(|_, _| {});
     StdioBackend::new(&spec, vec![], &dir, sink).with_limits(limits)
+}
+
+/// Unix prints `exit status: N`, Windows `exit code: N`.
+fn exited_with(e: &str, code: i32) -> bool {
+    e.contains(&format!("exit status: {code}")) || e.contains(&format!("exit code: {code}"))
 }
 
 fn limits(call_ms: u64) -> Limits {
@@ -45,7 +68,7 @@ fn big_args(bytes: usize) -> Value {
 /// pipe holds must still honour its cancel token and limit.
 #[test]
 fn cancel_and_limit_fire_while_the_pipe_is_full() {
-    let b = Arc::new(sh("wblock", "exec sleep 8", limits(300)));
+    let b = Arc::new(sh("wblock", "exec sleep 8", &["sleep:8000"], limits(300)));
     b.start().unwrap();
     let token = CancelToken::new();
     let (tx, rx) = mpsc::channel();
@@ -74,7 +97,12 @@ fn cancel_and_limit_fire_while_the_pipe_is_full() {
 /// Same server: shutdown must not wait behind the stalled writer.
 #[test]
 fn shutdown_does_not_wait_on_a_stalled_writer() {
-    let b = Arc::new(sh("sdblock", "exec sleep 8", limits(60_000)));
+    let b = Arc::new(sh(
+        "sdblock",
+        "exec sleep 8",
+        &["sleep:8000"],
+        limits(60_000),
+    ));
     b.start().unwrap();
     let b2 = b.clone();
     let call =
@@ -99,7 +127,12 @@ fn shutdown_does_not_wait_on_a_stalled_writer() {
 /// the exit is noticed anyway.
 #[test]
 fn exit_is_noticed_while_a_grandchild_holds_stdout() {
-    let b = sh("grand", "read l; sleep 6 & exit 3", limits(4_000));
+    let b = sh(
+        "grand",
+        "read l; sleep 6 & exit 3",
+        &["read", "spawn:6000:oe:bg:-", "exit:3"],
+        limits(4_000),
+    );
     b.start().unwrap();
     let t0 = Instant::now();
     let r = b.call_tool("x", Value::obj(vec![]), None, &CancelToken::new());
@@ -107,7 +140,7 @@ fn exit_is_noticed_while_a_grandchild_holds_stdout() {
     let st = b.status();
     match &r {
         Err(CallError::Unavailable(e)) => {
-            assert!(e.contains("exit status: 3"), "{e}");
+            assert!(exited_with(e, 3), "{e}");
             assert_eq!(st.error.as_deref(), Some(e.as_str()));
         }
         other => panic!("expected Unavailable, got {other:?}"),
@@ -126,6 +159,7 @@ fn a_call_in_the_exit_window_matches_the_status() {
     let b = Arc::new(sh(
         "window",
         "read l; sleep 4 >/dev/null & exit 3",
+        &["read", "spawn:4000:e:bg:-", "exit:3"],
         limits(10_000),
     ));
     b.start().unwrap();
@@ -148,7 +182,7 @@ fn a_call_in_the_exit_window_matches_the_status() {
             // The restarted server finished its handshake, got the call and
             // exited on it: not a handshake timeout.
             assert!(!e.contains("initialize"), "{e}");
-            assert!(e.contains("exit status: 3"), "{e}");
+            assert!(exited_with(e, 3), "{e}");
         }
         other => panic!("expected the dead server to be restarted or reported, got {other:?}"),
     }
@@ -160,7 +194,12 @@ fn a_call_in_the_exit_window_matches_the_status() {
 #[test]
 fn an_over_long_stdout_line_ends_the_connection() {
     let script = r#"read l; printf '{"jsonrpc":"2.0","id":2,"result":{"x":"'; head -c 67108864 /dev/zero | tr '\0' a; printf '"}}\n'; exec sleep 5"#;
-    let b = sh("bigline", script, limits(20_000));
+    let b = sh(
+        "bigline",
+        script,
+        &["read", "bigline:67108864", "sleep:5000"],
+        limits(20_000),
+    );
     let t0 = Instant::now();
     let r = b.call_tool("x", Value::obj(vec![]), None, &CancelToken::new());
     match &r {
@@ -177,7 +216,12 @@ fn an_over_long_stdout_line_ends_the_connection() {
 #[test]
 fn long_stderr_lines_are_cut() {
     let script = r#"head -c 1000000 /dev/zero | tr '\0' e >&2; echo >&2; exit 4"#;
-    let b = sh("bigerr", script, limits(5_000));
+    let b = sh(
+        "bigerr",
+        script,
+        &["bigerr:1000000", "exit:4"],
+        limits(5_000),
+    );
     let e = match b.start() {
         // The handshake may finish before the exit.
         Ok(()) => match b.call_tool("x", Value::obj(vec![]), None, &CancelToken::new()) {
@@ -198,7 +242,16 @@ fn ping_replies_do_not_block_the_reader() {
     // Never reads again; pings us 2000 times (each answer is queued), then
     // answers request 2.
     let script = r#"i=0; while [ $i -lt 2000 ]; do echo '{"jsonrpc":"2.0","id":"p'$i'","method":"ping"}'; i=$((i+1)); done; echo '{"jsonrpc":"2.0","id":2,"result":{"ok":true}}'; exec sleep 5"#;
-    let b = sh("ping", script, limits(5_000));
+    let b = sh(
+        "ping",
+        script,
+        &[
+            "pings:2000",
+            r#"print:{"jsonrpc":"2.0","id":2,"result":{"ok":true}}"#,
+            "sleep:5000",
+        ],
+        limits(5_000),
+    );
     let r = b
         .call_tool("x", big_args(1 << 20), None, &CancelToken::new())
         .unwrap();
@@ -215,7 +268,17 @@ fn clip(s: &str) -> String {
 #[test]
 fn a_malformed_server_request_does_not_fail_our_call() {
     let script = r#"read l; id=$(printf '%s' "$l" | sed 's/.*"id":\([0-9]*\).*/\1/'); printf '{"jsonrpc":"2.0","id":%s,"method":"roots/list","params":{"x":"\\q"}}\n' "$id"; printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"; sleep 2"#;
-    let b = sh("badreq", script, limits(5000));
+    let b = sh(
+        "badreq",
+        script,
+        &[
+            "read",
+            r#"print:{"jsonrpc":"2.0","id":$ID,"method":"roots/list","params":{"x":"\q"}}"#,
+            r#"print:{"jsonrpc":"2.0","id":$ID,"result":{"ok":true}}"#,
+            "sleep:2000",
+        ],
+        limits(5000),
+    );
     let r = b.call_tool("x", Value::obj(vec![]), None, &CancelToken::new());
     assert!(r.is_ok(), "{r:?}");
 }
@@ -224,7 +287,16 @@ fn a_malformed_server_request_does_not_fail_our_call() {
 #[test]
 fn a_malformed_reply_fails_the_call_at_once() {
     let script = r#"read l; id=$(printf '%s' "$l" | sed 's/.*"id":\([0-9]*\).*/\1/'); printf '{"jsonrpc":"2.0","id":%s,"result":{"x":"\\q"}}\n' "$id"; sleep 5"#;
-    let b = sh("badreply", script, limits(4000));
+    let b = sh(
+        "badreply",
+        script,
+        &[
+            "read",
+            r#"print:{"jsonrpc":"2.0","id":$ID,"result":{"x":"\q"}}"#,
+            "sleep:5000",
+        ],
+        limits(4000),
+    );
     let t = Instant::now();
     let r = b.call_tool("x", Value::obj(vec![]), None, &CancelToken::new());
     assert!(
@@ -244,7 +316,13 @@ fn one_large_call_to_a_busy_server_is_not_a_backlog() {
     let n = DIRS.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("mh-pipes-big-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(unix)]
     let spec = BackendSpec::stdio("pl", "perl", &["-e", perl]);
+    #[cfg(windows)]
+    let spec = {
+        let _ = perl;
+        BackendSpec::stdio("pl", FAKE, &["script", "serial"])
+    };
     let sink: EventSink = Arc::new(|_, _| {});
     let b = Arc::new(StdioBackend::new(&spec, vec![], &dir, sink).with_limits(limits(20_000)));
     b.start().unwrap();

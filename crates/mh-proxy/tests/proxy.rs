@@ -1287,6 +1287,26 @@ fn start_scripted(beta: &Arc<Scripted>, opts: Options) -> Harness {
     )
 }
 
+/// Poll `harness_status` (ids from `first_id` up) until `backend` is
+/// `failed`. A start runs on its own thread and `harness_status` does not
+/// wait for it, so right after `init` or opening a gate it may still say
+/// `starting` (seen on Windows under a parallel test load).
+fn wait_failed(h: &Harness, first_id: i64, backend: &str) {
+    let deadline = Instant::now() + DEADLINE;
+    let mut id = first_id;
+    loop {
+        let st = status_of(h, id, backend);
+        id += 1;
+        match st.get("state").unwrap().as_str() {
+            Some("failed") => return,
+            Some("starting") => {}
+            other => panic!("{backend}: unexpected state {other:?}"),
+        }
+        assert!(Instant::now() < deadline, "{backend} never failed");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn gate_open(gate: &(Mutex<bool>, Condvar)) {
     *gate.0.lock().unwrap() = true;
     gate.1.notify_all();
@@ -1363,9 +1383,8 @@ fn cancelled_call_waiting_on_a_fetch_does_no_more_work() {
     h.send(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":20}}"#);
     h.request(2, "ping", "{}");
     gate_open(&gate);
-    // The status call runs after the startup fetch settles.
-    let st = status_of(&h, 3, "beta");
-    assert_eq!(st.get("state").unwrap().as_str(), Some("failed"));
+    // The gated first start now fails, on its own thread.
+    wait_failed(&h, 3, "beta");
     let out = h.finish();
     assert_eq!(beta.starts(), 1, "the cancelled call started the backend");
     assert_eq!(beta.calls.load(Ordering::SeqCst), 0);
@@ -1426,10 +1445,9 @@ fn cancel_ends_a_call_whose_own_fetch_hangs() {
     });
     let h = start_scripted(&beta, no_timer());
     h.init();
-    let st = status_of(&h, 1, "beta");
-    assert_eq!(st.get("state").unwrap().as_str(), Some("failed"));
-    h.send(r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"beta_echo"}}"#);
+    wait_failed(&h, 50, "beta");
     let deadline = Instant::now() + DEADLINE;
+    h.send(r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"beta_echo"}}"#);
     while beta.starts() < 2 {
         assert!(
             Instant::now() < deadline,
