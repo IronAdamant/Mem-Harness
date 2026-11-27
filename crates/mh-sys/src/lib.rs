@@ -6,9 +6,14 @@
 //! dependencies. Every function is safe to call, and fails by returning
 //! `false` or an empty list. Nothing here is unsafe outside this file.
 //!
-//! On platforms without these calls (Windows today) each function is a
-//! no-op that returns `false` or nothing, and callers fall back to what
-//! std offers (`Child::kill`).
+//! Windows has no process groups or signals. There a [`Job`] (a Windows
+//! job object) does what a process group does on Unix: a child is put in
+//! one as soon as it is started, every process it starts joins it, and
+//! [`Job::terminate`] ends them all. [`stop_std_inheritance`] keeps our own
+//! stdin, stdout and stderr from being handed to every process we start.
+//! The Unix-only functions are no-ops on Windows and the Windows-only ones
+//! are no-ops on Unix, each returning `false`, `None` or nothing, and
+//! callers fall back to what std offers (`Child::kill`).
 
 /// `SIGTERM`: ask a process to exit. 15 on every Unix this builds for.
 pub const SIGTERM: i32 = 15;
@@ -25,6 +30,240 @@ mod ffi {
     extern "C" {
         // int prctl(int option, ...);
         pub fn prctl(option: i32, ...) -> i32;
+    }
+}
+
+#[cfg(windows)]
+#[allow(clippy::upper_case_acronyms)]
+mod win {
+    use std::ffi::c_void;
+
+    pub type HANDLE = *mut c_void;
+    pub type BOOL = i32;
+
+    /// JOBOBJECT_BASIC_LIMIT_INFORMATION.
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct BasicLimit {
+        pub per_process_user_time_limit: i64,
+        pub per_job_user_time_limit: i64,
+        pub limit_flags: u32,
+        pub minimum_working_set_size: usize,
+        pub maximum_working_set_size: usize,
+        pub active_process_limit: u32,
+        pub affinity: usize,
+        pub priority_class: u32,
+        pub scheduling_class: u32,
+    }
+
+    /// JOBOBJECT_EXTENDED_LIMIT_INFORMATION (IO_COUNTERS is six u64s).
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct ExtendedLimit {
+        pub basic: BasicLimit,
+        pub io: [u64; 6],
+        pub process_memory_limit: usize,
+        pub job_memory_limit: usize,
+        pub peak_process_memory_used: usize,
+        pub peak_job_memory_used: usize,
+    }
+
+    /// JOBOBJECT_BASIC_ACCOUNTING_INFORMATION.
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct Accounting {
+        pub times: [i64; 4],
+        pub total_page_fault_count: u32,
+        pub total_processes: u32,
+        pub active_processes: u32,
+        pub total_terminated_processes: u32,
+    }
+
+    pub const JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION: i32 = 1;
+    pub const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+    pub const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
+    pub const HANDLE_FLAG_INHERIT: u32 = 1;
+    /// STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE: (DWORD)-10, -11, -12.
+    pub const STD_HANDLES: [u32; 3] = [0xFFFF_FFF6, 0xFFFF_FFF5, 0xFFFF_FFF4];
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn CreateJobObjectW(attributes: *mut c_void, name: *const u16) -> HANDLE;
+        pub fn SetInformationJobObject(
+            job: HANDLE,
+            class: i32,
+            info: *mut c_void,
+            len: u32,
+        ) -> BOOL;
+        pub fn QueryInformationJobObject(
+            job: HANDLE,
+            class: i32,
+            info: *mut c_void,
+            len: u32,
+            returned: *mut u32,
+        ) -> BOOL;
+        pub fn AssignProcessToJobObject(job: HANDLE, process: HANDLE) -> BOOL;
+        pub fn TerminateJobObject(job: HANDLE, exit_code: u32) -> BOOL;
+        pub fn CloseHandle(handle: HANDLE) -> BOOL;
+        pub fn GetStdHandle(which: u32) -> HANDLE;
+        pub fn SetHandleInformation(handle: HANDLE, mask: u32, flags: u32) -> BOOL;
+    }
+}
+
+/// Windows: a job object holding a child and everything it starts, the
+/// stand-in for a Unix process group. Elsewhere [`Job::new`] returns `None`.
+///
+/// Put the child in with [`Job::assign`] right after spawning it. A process
+/// the child starts in the moment before that is not in the job; every
+/// later one is, however deep and whether or not its parent still runs.
+pub struct Job {
+    #[cfg(windows)]
+    handle: win::HANDLE,
+}
+
+// SAFETY: a job handle is a reference to a kernel object; the calls made
+// with it are thread-safe and the handle is closed only in `drop`.
+unsafe impl Send for Job {}
+// SAFETY: as above.
+unsafe impl Sync for Job {}
+
+impl Job {
+    /// A new, empty job. With `kill_on_close`, whatever is still in it when
+    /// the `Job` is dropped (or this process exits) is ended then. `None`
+    /// off Windows, or when the job cannot be made.
+    pub fn new(kill_on_close: bool) -> Option<Job> {
+        #[cfg(windows)]
+        {
+            // SAFETY: both pointers may be null: no security attributes, no name.
+            let handle = unsafe { win::CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+            if handle.is_null() {
+                return None;
+            }
+            let job = Job { handle };
+            if kill_on_close {
+                let mut info = win::ExtendedLimit::default();
+                info.basic.limit_flags = win::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                // SAFETY: `info` is a live JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+                // of the size given.
+                let ok = unsafe {
+                    win::SetInformationJobObject(
+                        job.handle,
+                        win::JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                        (&mut info as *mut win::ExtendedLimit).cast(),
+                        std::mem::size_of::<win::ExtendedLimit>() as u32,
+                    )
+                };
+                if ok == 0 {
+                    return None;
+                }
+            }
+            Some(job)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = kill_on_close;
+            None
+        }
+    }
+
+    /// Put a running child in the job. `false` when it has exited or the
+    /// call fails.
+    pub fn assign(&self, child: &std::process::Child) -> bool {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            // SAFETY: both handles are open: the job's for as long as
+            // `self`, the child's process handle for as long as `child`.
+            unsafe { win::AssignProcessToJobObject(self.handle, child.as_raw_handle().cast()) != 0 }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = child;
+            false
+        }
+    }
+
+    /// End every process in the job. `false` when the call fails.
+    pub fn terminate(&self) -> bool {
+        #[cfg(windows)]
+        {
+            // SAFETY: the handle is open for as long as `self`.
+            unsafe { win::TerminateJobObject(self.handle, 1) != 0 }
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    /// How many processes in the job are still running (0 when unknown).
+    pub fn active(&self) -> u32 {
+        #[cfg(windows)]
+        {
+            let mut info = win::Accounting::default();
+            // SAFETY: `info` is a live JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+            // of the size given; the returned-length pointer may be null.
+            let ok = unsafe {
+                win::QueryInformationJobObject(
+                    self.handle,
+                    win::JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION,
+                    (&mut info as *mut win::Accounting).cast(),
+                    std::mem::size_of::<win::Accounting>() as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                0
+            } else {
+                info.active_processes
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            0
+        }
+    }
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        // SAFETY: the handle is ours and closed only here.
+        #[cfg(windows)]
+        unsafe {
+            win::CloseHandle(self.handle);
+        }
+    }
+}
+
+/// Windows: stop handing our own stdin, stdout and stderr to every process
+/// we start. std starts children with handle inheritance on, so otherwise a
+/// child, and anything it leaves running, holds a copy of the pipes our
+/// parent reads, and the parent sees no end of our output until the last of
+/// them exits. Pipes std makes for a child (`Stdio::piped`, `inherit`) are
+/// made inheritable by std itself, so they still work. Call once at
+/// startup. `false` off Windows or when a call fails.
+pub fn stop_std_inheritance() -> bool {
+    #[cfg(windows)]
+    {
+        let mut all = true;
+        for which in win::STD_HANDLES {
+            // SAFETY: GetStdHandle takes a constant. A null or invalid
+            // result is skipped; SetHandleInformation only changes a flag.
+            unsafe {
+                let h = win::GetStdHandle(which);
+                if h.is_null() || h as isize == -1 {
+                    continue;
+                }
+                if win::SetHandleInformation(h, win::HANDLE_FLAG_INHERIT, 0) == 0 {
+                    all = false;
+                }
+            }
+        }
+        all
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
@@ -200,5 +439,66 @@ mod tests {
         assert!(signal_group(child.id(), SIGKILL));
         let _ = child.wait();
         assert!(wait_gone(grandchild), "grandchild survived the group kill");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    fn wait_for(mut ok: impl FnMut() -> bool) -> bool {
+        let end = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < end {
+            if ok() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// A background process the child starts is in the job, and ends with it.
+    #[test]
+    fn terminate_reaches_a_background_grandchild() {
+        let job = Job::new(true).expect("job");
+        let mut child = Command::new("cmd")
+            .args([
+                "/c",
+                "start /b ping -n 30 127.0.0.1 >nul & ping -n 30 127.0.0.1 >nul",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(job.assign(&child));
+        assert!(wait_for(|| job.active() >= 3), "active {}", job.active());
+        assert!(job.terminate());
+        let _ = child.wait();
+        assert!(wait_for(|| job.active() == 0), "left {}", job.active());
+    }
+
+    /// Dropping a kill-on-close job ends what is left in it.
+    #[test]
+    fn drop_ends_what_is_left() {
+        let job = Job::new(true).expect("job");
+        let mut child = Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(job.assign(&child));
+        drop(job);
+        let start = Instant::now();
+        let _ = child.wait();
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn std_handles_stop_being_inherited() {
+        // May be false when a std handle is a console or absent; it must not panic.
+        let _ = stop_std_inheritance();
     }
 }

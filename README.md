@@ -103,7 +103,10 @@ The config is read in three layers:
 
 1. **Yours:** `$MEM_HARNESS_CONFIG`, else `~/.mem-harness/harness.json`, else
    the built-in one (`mem-harness print-config` prints it). Only this layer
-   may name commands: `backends`, `stores` and `brief_sections`.
+   may name commands: `backends`, `stores` and `brief_sections`. On Windows
+   `~` is `%USERPROFILE%`. Save the file as UTF-8 (a byte order mark is
+   fine): Windows PowerShell 5.1's `>` writes UTF-16, which is refused, so
+   use `mem-harness print-config | Set-Content -Encoding utf8 $HOME\.mem-harness\harness.json`.
 2. **The project's:** `<project>/.mem-harness/harness.json`, laid over yours.
    Claude Code may open any repository, so this file may only pick one of
    your profiles (`profile`), change `brief` settings, and set `main_agent`.
@@ -137,7 +140,7 @@ Its tools appear as `docs_<tool>`. The optional settings:
 | `handshake_s` | how long to wait for it to start (default 20) |
 | `call_s` | the cap on one call (default 3600) |
 | `env_pass` | gives it only the basic system variables plus these, instead of your whole environment. Use it for servers you did not write. |
-| `keep_children` | leave processes the server started running when it stops (normally its whole process group is stopped with it) |
+| `keep_children` | leave processes the server started running when it stops (normally everything it started is stopped with it: its process group on Unix, its job object on Windows) |
 | `hide_tools` / `only_tools` | the proxy hides tools itself, so this works for servers that have no `*_DISABLE` variable. A pattern matches the server's own tool name, or that name after `strip_prefix`. `*` is a wildcard. |
 
 A remote server works through a stdio bridge such as `mcp-remote`. The

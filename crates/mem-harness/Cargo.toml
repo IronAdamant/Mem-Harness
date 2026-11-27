@@ -12,6 +12,7 @@ mh-json = { path = "../mh-json" }
 mh-core = { path = "../mh-core" }
 mh-hooks = { path = "../mh-hooks" }
 mh-proxy = { path = "../mh-proxy" }
+mh-sys = { path = "../mh-sys" }
 [[bin]]
 name = "mem-harness"
 path = "src/main.rs"

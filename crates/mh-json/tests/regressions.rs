@@ -11,17 +11,12 @@ fn edges() {
     assert!(parse(&("[".repeat(256) + &"]".repeat(256))).is_ok());
     assert!(parse(&("[".repeat(258) + &"]".repeat(258))).is_err());
     assert_eq!(parse("-0").unwrap(), Value::Num("-0".into()));
-    for bad in [
-        "1e",
-        "1e+",
-        "-01",
-        ".5",
-        r#""\ud83dA""#,
-        r#""\udc00""#,
-        r#""\u00""#,
-    ] {
+    for bad in ["1e", "1e+", "-01", ".5", r#""\u00""#] {
         assert!(parse(bad).is_err(), "{bad}");
     }
+    // Lone surrogates become U+FFFD instead of failing the whole text.
+    assert_eq!(parse(r#""\ud83dA""#).unwrap(), Value::str("\u{fffd}A"));
+    assert_eq!(parse(r#""\udc00""#).unwrap(), Value::str("\u{fffd}"));
     let k = parse(r#"{"\u0000":"\u001f"}"#).unwrap();
     assert_eq!(parse(&k.to_json()).unwrap(), k);
     let big = format!("[{}]", vec!["{\"k\":1}"; 200_000].join(","));

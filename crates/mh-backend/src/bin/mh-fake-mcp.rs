@@ -17,7 +17,8 @@
 //! (JSON-RPC error -32000), `crash` (exit 3), `notify` (list_changed,
 //! progress, message, then a reply), `ping` (sends the client a `ping` and
 //! an unknown request, replies with both answers), `env` (`names`: a list
-//! of variable names; returns `{"vars": {name: value or null}}`).
+//! of variable names; returns `{"vars": {name: value or null}}`). Unlisted:
+//! `deep` (a reply nested too deep for mh-json).
 
 use mh_json::Value;
 use std::io::{BufRead, Write};
@@ -109,6 +110,11 @@ fn main() {
         std::process::exit(2);
     }
     if std::env::var("FAKE_STARTUP_HANG").is_ok() {
+        // Logged so a test can check the hung process is stopped.
+        log(&format!(
+            "{{\"event\":\"started\",\"pid\":{}}}",
+            std::process::id()
+        ));
         loop {
             thread::sleep(Duration::from_secs(60));
         }
@@ -237,6 +243,18 @@ fn main() {
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
                 let meta = params.get("_meta").cloned().unwrap_or(Value::Null);
                 match name.as_str() {
+                    // Not listed: a reply nested too deep to parse.
+                    "deep" => {
+                        let line = format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{}{}}}\n",
+                            id.to_json(),
+                            "[".repeat(300),
+                            "]".repeat(300)
+                        );
+                        let mut o = out.lock().unwrap();
+                        let _ = o.write_all(line.as_bytes());
+                        let _ = o.flush();
+                    }
                     "echo" => {
                         let delay =
                             args.get("delay_ms").and_then(Value::as_i64).unwrap_or(0) as u64;

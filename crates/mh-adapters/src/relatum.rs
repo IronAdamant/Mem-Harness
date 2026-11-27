@@ -239,7 +239,12 @@ fn walk(
         let Ok(ft) = entry.file_type() else { continue };
         let path = entry.path();
         if ft.is_dir() {
-            walk(store, &path, &format!("{prefix}{name}/"), out, damaged)?;
+            // A sub-folder that cannot be read (a Windows ACL, a folder held
+            // open) is reported as damaged; the other notes still count.
+            let sub = format!("{prefix}{name}/");
+            if let Err(e) = walk(store, &path, &sub, out, damaged) {
+                damaged.push((sub, e));
+            }
         } else if let Some(stem) = name.strip_suffix(".md") {
             if ft.is_symlink() && !path.is_file() {
                 continue;
@@ -522,5 +527,35 @@ mod tests {
         let n = read_note(&store, "win/rule").unwrap().unwrap();
         assert_eq!(n.summary, "CRLF rule.");
         assert_eq!(active_rules(&store).unwrap().rules.len(), 1);
+    }
+
+    /// One sub-folder that cannot be read is damaged; the other notes count.
+    #[test]
+    #[cfg(unix)]
+    fn an_unreadable_folder_does_not_hide_the_other_notes() {
+        use std::os::unix::fs::PermissionsExt;
+        let project = tmp();
+        let store = project.join(".swarmnotes");
+        put(
+            &store,
+            "ok/rule",
+            "---\nkind: constraint\nsummary: Kept.\n---\n",
+        );
+        put(
+            &store,
+            "locked/rule",
+            "---\nkind: constraint\nsummary: Hidden.\n---\n",
+        );
+        let locked = store.join("locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = fs::read_dir(&locked).is_ok(); // root reads anything
+        let s = scan(&store);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        let s = s.unwrap();
+        assert!(s.notes.iter().any(|n| n.id == "ok/rule"), "{s:?}");
+        if !readable {
+            assert_eq!(s.damaged.len(), 1, "{s:?}");
+            assert_eq!(s.damaged[0].0, "locked/");
+        }
     }
 }

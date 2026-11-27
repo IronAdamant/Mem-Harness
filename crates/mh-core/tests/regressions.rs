@@ -11,6 +11,7 @@ struct Sandbox {
     dir: PathBuf,
     project: PathBuf,
     old_home: Option<std::ffi::OsString>,
+    old_profile: Option<std::ffi::OsString>,
 }
 
 impl Sandbox {
@@ -23,13 +24,16 @@ impl Sandbox {
         let home = dir.join("home");
         std::fs::create_dir_all(&home).unwrap();
         let old_home = std::env::var_os("HOME");
+        let old_profile = std::env::var_os("USERPROFILE");
         std::env::set_var("HOME", &home);
+        std::env::set_var("USERPROFILE", &home);
         std::env::remove_var("MEM_HARNESS_CONFIG");
         std::env::remove_var("MEM_HARNESS_PROFILE");
         Sandbox {
             dir,
             project,
             old_home,
+            old_profile,
         }
     }
     fn overlay(&self, text: &str) {
@@ -45,6 +49,10 @@ impl Drop for Sandbox {
         match self.old_home.take() {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
+        }
+        match self.old_profile.take() {
+            Some(h) => std::env::set_var("USERPROFILE", h),
+            None => std::env::remove_var("USERPROFILE"),
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }

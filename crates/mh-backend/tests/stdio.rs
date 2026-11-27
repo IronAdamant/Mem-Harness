@@ -588,6 +588,17 @@ fn alive(pid: i64) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Is a process with this pid still there (`tasklist`)?
+#[cfg(windows)]
+fn alive(pid: i64) -> bool {
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
+}
+
 /// Drop the backend and check the server is gone.
 fn assert_drop_stops(f: Fixture) {
     f.backend.start().unwrap();
@@ -600,10 +611,7 @@ fn assert_drop_stops(f: Fixture) {
     // Drop closed the server's stdin ...
     assert!(wait_for(|| has_event(&log, "stdin-eof")));
     // ... and the server is gone (killed, if it ignores EOF).
-    #[cfg(unix)]
     assert!(wait_for(|| !alive(pid)), "pid {pid} still running");
-    #[cfg(not(unix))]
-    let _ = pid;
 }
 
 #[test]
@@ -618,6 +626,64 @@ fn drop_kills_a_server_that_ignores_eof() {
         ..quick()
     };
     assert_drop_stops(fixture("dropkill", &[("FAKE_IGNORE_EOF", "1")], limits));
+}
+
+/// A wrapper that starts the fake as its own child (not `exec`), the way
+/// `npx`, a `.cmd` shim or `sh -c` does: the server is a grandchild.
+fn wrapped(tag: &str, env: &[(&str, &str)], limits: Limits) -> Fixture {
+    let mut f = fixture(tag, env, quick());
+    let dir = f._dir.clone();
+    #[cfg(windows)]
+    let wrapper = {
+        let w = dir.join("wrap.cmd");
+        std::fs::write(&w, format!("@\"{FAKE}\" %*\r\n")).unwrap();
+        w
+    };
+    #[cfg(unix)]
+    let wrapper = {
+        use std::os::unix::fs::PermissionsExt;
+        let w = dir.join("wrap.sh");
+        std::fs::write(&w, format!("#!/bin/sh\n'{FAKE}' \"$@\"\nexit $?\n")).unwrap();
+        std::fs::set_permissions(&w, std::fs::Permissions::from_mode(0o755)).unwrap();
+        w
+    };
+    let mut env: Vec<(String, String)> = env
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    env.push(("FAKE_LOG".into(), f.log.display().to_string()));
+    let ev = f.events.clone();
+    let sink: EventSink = Arc::new(move |name, e| ev.lock().unwrap().push((name.to_string(), e)));
+    f.backend = StdioBackend::new(&spec(&wrapper.display().to_string()), env, &dir, sink)
+        .with_limits(limits);
+    f
+}
+
+/// The server behind a wrapper is stopped with it, even when it ignores
+/// EOF (on Windows this needs the job object; killing the wrapper alone
+/// would leave it running).
+#[test]
+fn drop_stops_a_server_behind_a_wrapper() {
+    let limits = Limits {
+        shutdown_grace: Duration::from_millis(200),
+        ..quick()
+    };
+    assert_drop_stops(wrapped("wrapdrop", &[("FAKE_IGNORE_EOF", "1")], limits));
+}
+
+/// A server behind a wrapper that never answers `initialize` is stopped
+/// when the handshake times out, not left running.
+#[test]
+fn a_hung_server_behind_a_wrapper_is_stopped_at_the_handshake_timeout() {
+    let limits = Limits {
+        handshake: Duration::from_millis(500),
+        restart_block: Duration::ZERO,
+        ..quick()
+    };
+    let f = wrapped("wraphang", &[("FAKE_STARTUP_HANG", "1")], limits);
+    assert!(f.backend.start().is_err());
+    let pid = fake_pid(&f.log).expect("the fake logged its start");
+    assert!(wait_for(|| !alive(pid)), "pid {pid} still running");
 }
 
 #[test]
@@ -722,4 +788,28 @@ fn unknown_kind_lists_the_known_ones() {
         .unwrap();
     assert!(e.contains("unknown kind \"http-mcp\""), "{e}");
     assert!(e.contains("known: stdio-mcp"), "{e}");
+}
+
+/// A reply that does not parse fails its call at once (it used to be
+/// skipped, and the call waited out its whole limit).
+#[test]
+fn an_unparseable_reply_fails_its_call_at_once() {
+    let f = fixture("deep", &[], quick());
+    let t = Instant::now();
+    let r = f
+        .backend
+        .call_tool("deep", Value::obj(vec![]), None, &CancelToken::new());
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    match r {
+        Err(CallError::Rpc { code, message, .. }) => {
+            assert_eq!(code, -32700);
+            assert!(message.contains("not valid JSON"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // The connection is still usable.
+    assert!(f
+        .backend
+        .call_tool("echo", Value::obj(vec![]), None, &CancelToken::new())
+        .is_ok());
 }

@@ -8,9 +8,10 @@ memories that survive compaction.
 
 - **Zero dependencies.** Every crate's `[dependencies]` holds only path deps on
   sibling crates in this workspace. No crates.io. std only, except the few
-  OS calls std lacks (signal a process group, Linux subreaper), declared by
-  hand in `mh-sys` against the C library std already links. No other crate
-  uses `unsafe`.
+  OS calls std lacks (signal a process group, Linux subreaper; on Windows a
+  job object and not handing our std handles to children), declared by
+  hand in `mh-sys` against the C library and kernel32 std already links.
+  No other crate uses `unsafe`.
 - Rust 1.83+, edition 2021. `cargo fmt`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test` must pass.
 - JSON goes through `mh-json` (`Value`, `parse`, `to_json`). Numbers keep their
@@ -211,6 +212,16 @@ process makes itself a subreaper (`mh_hooks::adopt_orphans`, called by
 process that double-forked out of a command's tree is re-parented to it
 and stopped with the timed-out command.
 
+On Windows, where there are no process groups or signals, each command is
+put in a job object as soon as it starts; every process it starts later
+joins the job, and the job is ended where Unix kills the group. The hook
+process and the MCP server clear the inherit flag on their own stdin,
+stdout and stderr at startup (`mh_sys::stop_std_inheritance`): std starts
+children with handle inheritance on, so otherwise every child, and anything
+it leaves running, would hold a copy of Claude Code's pipes, and Claude
+Code would wait for the last of them to exit before seeing the end of a
+hook's output.
+
 ## Claims about rules
 
 Decided 2026-11-26: the Relatum evidence adapter lives in **Adsertio itself**
@@ -224,9 +235,13 @@ pointers come only from Adsertio (`adsertio_view`).
 - On Unix each backend server runs in its own process group, and when its
   connection ends (exit, crash, write error, over-long line, shutdown) the
   group gets TERM, then KILL after 500 ms. A process that left the group
-  (`setsid`, a daemonizing double fork) is not reached. With
-  `keep_children`, and on Windows (no groups; only the server itself is
-  killed), a process the server started that keeps the server's pipes open
+  (`setsid`, a daemonizing double fork) is not reached. On Windows each
+  server is put in a job object right after it starts, and the job is
+  ended at once (Windows has no TERM); dropping the connection closes the
+  job, which ends whatever is still in it. A process the server starts in
+  the moment before it joins the job is not reached (std does not expose
+  the thread handle a suspended start needs). With `keep_children`, a
+  process the server started that keeps the server's pipes open
   keeps that connection's threads alive until it exits: the reader and
   stderr threads wait for EOF, and the writer can stay blocked in `write`
   if that process holds stdin without reading it. Nothing waits on those

@@ -182,6 +182,8 @@ fn cmd_init() -> Result<(), String> {
 }
 
 fn cmd_mcp() -> Result<(), String> {
+    // Windows: the backends must not hold Claude Code's pipes to us.
+    mh_sys::stop_std_inheritance();
     let (root, cfg) = load()?;
     let natives = natives(&root, &cfg);
     let input = std::io::BufReader::new(std::io::stdin());
@@ -190,6 +192,9 @@ fn cmd_mcp() -> Result<(), String> {
 
 /// A hook never stops the session: errors go to stderr and the exit code is 0.
 fn cmd_hook(rest: &[String]) -> ExitCode {
+    // Windows: what a hook command leaves running must not hold Claude
+    // Code's pipes to us (see mh_hooks::run).
+    mh_sys::stop_std_inheritance();
     let Some(event) = rest.first() else {
         eprintln!(
             "mem-harness hook: give an event: {}",

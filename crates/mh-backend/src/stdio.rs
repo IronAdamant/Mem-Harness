@@ -201,8 +201,11 @@ struct Conn {
     label: String,
     /// The start attempt that made it (see the module docs).
     seq: u64,
-    /// Its process group (its own pid), when it leads one.
+    /// Its process group (its own pid), when it leads one (Unix).
     pgid: Option<u32>,
+    /// The job holding it and everything it starts (Windows): the stand-in
+    /// for the process group. Closing it ends whatever is left in it.
+    job: Option<mh_sys::Job>,
     /// The writer thread's queue; `None` once stdin is being closed.
     /// `Sender::send` never blocks, so this is held only for a push.
     out: Mutex<Option<Sender<Vec<u8>>>>,
@@ -321,6 +324,10 @@ impl Conn {
                 if let Some(g) = self.pgid {
                     mh_sys::signal_group(g, mh_sys::SIGTERM);
                 }
+                // Windows has no TERM: end the whole job now.
+                if let Some(j) = &self.job {
+                    j.terminate();
+                }
                 let _ = child.kill();
             }
         }
@@ -334,6 +341,9 @@ impl Conn {
     /// the first check that finds the group empty, so a KILL is never sent
     /// to an id that has been given to someone else.
     fn stop_group(&self) {
+        if let Some(j) = &self.job {
+            j.terminate();
+        }
         let Some(pgid) = self.pgid else {
             return;
         };
@@ -379,6 +389,9 @@ impl Conn {
                         self.killed.store(true, Ordering::SeqCst);
                         if let Some(g) = self.pgid {
                             mh_sys::signal_group(g, mh_sys::SIGKILL);
+                        }
+                        if let Some(j) = &self.job {
+                            j.terminate();
                         }
                         let _ = child.kill();
                         return match child.wait() {
@@ -792,11 +805,29 @@ fn reader_loop(core: Arc<Core>, conn: Arc<Conn>, stdout: impl Read) {
             if !line.is_empty() {
                 match mh_json::parse(line) {
                     Ok(msg) => core.handle(&conn, msg),
-                    Err(e) => eprintln!(
-                        "[{}] skipping an unparseable line from the server ({e}): {}",
-                        core.name,
-                        clip(line)
-                    ),
+                    Err(e) => {
+                        eprintln!(
+                            "[{}] skipping an unparseable line from the server ({e}): {}",
+                            core.name,
+                            clip(line)
+                        );
+                        // When it was the reply to a call, fail that call now
+                        // instead of letting it wait out its whole limit.
+                        let waiter = mh_json::find_id(line)
+                            .and_then(|id| id.as_i64())
+                            .and_then(|n| u64::try_from(n).ok())
+                            .and_then(|n| lock(&conn.pending).waiting.remove(&n));
+                        if let Some(w) = waiter {
+                            let _ = w.tx.send(Err(CallError::Rpc {
+                                code: -32700,
+                                message: format!(
+                                    "{} sent a reply that is not valid JSON ({e})",
+                                    core.name
+                                ),
+                                data: None,
+                            }));
+                        }
+                    }
                 }
             }
         }
@@ -1023,7 +1054,7 @@ impl Launch {
                 }
             }
         }
-        let grouped = cfg!(unix) && !self.keep_children;
+        let grouped = !self.keep_children;
         #[cfg(unix)]
         if grouped {
             use std::os::unix::process::CommandExt;
@@ -1044,6 +1075,14 @@ impl Launch {
                     self.project.display()
                 )
             })?;
+        // Windows: put the child in a job at once, so the processes it
+        // starts join it too (one started in the moment before this does
+        // not). Without a job only the child itself can be stopped.
+        let job = if grouped && cfg!(windows) {
+            mh_sys::Job::new(true).filter(|j| j.assign(&child))
+        } else {
+            None
+        };
         let stdin = child.stdin.take().ok_or("stdin was not piped")?;
         let stdout = child.stdout.take().ok_or("stdout was not piped")?;
         let stderr = child.stderr.take().ok_or("stderr was not piped")?;
@@ -1051,7 +1090,8 @@ impl Launch {
         let conn = Arc::new(Conn {
             label: self.label(),
             seq,
-            pgid: grouped.then(|| child.id()),
+            pgid: (grouped && cfg!(unix)).then(|| child.id()),
+            job,
             out: Mutex::new(Some(tx)),
             queued: AtomicUsize::new(0),
             child: Mutex::new(child),

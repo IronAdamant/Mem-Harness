@@ -761,7 +761,10 @@ impl Shared {
         let msg = match mh_json::parse(line) {
             Ok(v) => v,
             Err(e) => {
-                return self.send_error(Value::Null, PARSE_ERROR, format!("parse error: {e}"), None)
+                // Answer the request it was, when its id can be found, so
+                // the client is not left waiting for a reply.
+                let id = mh_json::find_id(line).unwrap_or(Value::Null);
+                return self.send_error(id, PARSE_ERROR, format!("parse error: {e}"), None);
             }
         };
         let pairs = match &msg {
