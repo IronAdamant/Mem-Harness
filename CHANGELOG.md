@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- The stop check no longer asks to save after a turn whose only change is a `git pull`, `checkout` or `reset` to commits made earlier. `HEAD` moving now counts as an edit only when the turn made a commit. A snapshot saved by 0.4.x is not read as a baseline, so the first stop after upgrading falls back to the edit tools in the transcript.
+
 ## 0.4.1
 
 Windows compatibility fixes from an adversarial review on Windows 11. Each one was reproduced there except the `env_pass` additions and the `USERPROFILE` order. macOS and Linux behave as before, apart from the JSON and Relatum changes, which apply everywhere.

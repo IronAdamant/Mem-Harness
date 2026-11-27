@@ -239,3 +239,57 @@ fn no_prompt_in_the_window_allows_the_stop() {
     assert_eq!(stop(&Config::builtin(), &dir, &input, false).unwrap(), "{}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `git` with a fixed, old committer date, as commits fetched from
+/// elsewhere have.
+fn git_old(dir: &Path, args: &[&str]) {
+    let st = std::process::Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
+        .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
+        .status()
+        .unwrap();
+    assert!(st.success(), "git {args:?}");
+}
+
+/// A `git pull` (here a fast-forward to a commit made earlier) moves HEAD
+/// and the files with it, but the turn edited nothing: no nudge.
+#[test]
+fn fast_forward_to_older_commits_is_not_an_edit() {
+    if !has_git() {
+        return;
+    }
+    let s = Session::new("pull");
+    git(&s.dir, &["checkout", "-q", "-b", "upstream"]);
+    std::fs::write(s.dir.join("a.txt"), "from elsewhere\n").unwrap();
+    git(&s.dir, &["add", "a.txt"]);
+    git_old(&s.dir, &["commit", "-q", "-m", "upstream work"]);
+    git(&s.dir, &["checkout", "-q", "-"]);
+    s.prompt_submit();
+    git(&s.dir, &["merge", "-q", "--ff-only", "upstream"]);
+    assert!(
+        !s.stop_with(&[PROMPT, BASH, RESULT, TEXT]),
+        "a pull was taken for an edit"
+    );
+    // Switching back is not an edit either.
+    s.prompt_submit();
+    git(&s.dir, &["checkout", "-q", "upstream"]);
+    assert!(!s.stop_with(&[PROMPT, BASH, RESULT, TEXT]));
+}
+
+/// Edits committed within the turn leave a clean tree, but the new commit
+/// is the turn's: nudged.
+#[test]
+fn a_commit_made_in_the_turn_is_an_edit() {
+    if !has_git() {
+        return;
+    }
+    let s = Session::new("commit");
+    s.prompt_submit();
+    std::fs::write(s.dir.join("a.txt"), "edited and committed\n").unwrap();
+    git(&s.dir, &["add", "a.txt"]);
+    git(&s.dir, &["commit", "-q", "-m", "turn work"]);
+    assert!(s.stop_with(&[PROMPT, BASH, RESULT, TEXT]));
+}

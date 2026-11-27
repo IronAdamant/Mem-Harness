@@ -813,7 +813,9 @@ pub fn stop_with(
     }
     let turn = last_turn(&read_tail(Path::new(&path))?, &cfg.brief);
     let edited = match (&now, &baseline) {
-        (Some(n), Some(b)) => n != b && (turn.edited || turn.shell),
+        (Some(n), Some(b)) => {
+            (turn.edited || turn.shell) && crate::snapshot::changed(b, n, project, timeout, run)
+        }
         _ => turn.edited,
     };
     if !turn.started || !edited || turn.saved {
