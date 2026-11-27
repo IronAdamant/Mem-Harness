@@ -19,7 +19,11 @@ Usage:
   mem-harness brief [--agent NAME]      print the merged compaction brief
   mem-harness init                      create the Relatum, Libellus and Adsertio stores here if missing
   mem-harness ownership                 print who owns each feature and what is hidden where
-  mem-harness doctor                    check config, project and every backend's binary
+  mem-harness doctor                    check config, project, every backend's binary and where stores live
+  mem-harness env [--powershell]        print the store variables, to run the tools by hand with the same stores
+  mem-harness projects                  list the projects with stores kept by the harness
+  mem-harness projects move OLD NEW     carry a renamed or moved project's stores to its new path
+  mem-harness projects forget PROJECT   delete a project's stores (PROJECT: its path or id)
   mem-harness install                   print the user-wide MCP entry and hook settings to paste
   mem-harness print-config              print the built-in harness.json (copy to ~/.mem-harness/harness.json to edit)
   mem-harness --version
@@ -43,6 +47,8 @@ fn main() -> ExitCode {
         "init" => no_args(rest).and_then(|_| cmd_init()),
         "doctor" => return cmd_doctor(rest),
         "install" => no_args(rest).and_then(|_| cmd_install()),
+        "env" => cmd_env(rest),
+        "projects" => cmd_projects(rest),
         "print-config" => no_args(rest).map(|_| print!("{}", config::DEFAULT_JSON)),
         "--version" | "-V" | "version" => {
             println!("mem-harness {}", env!("CARGO_PKG_VERSION"));
@@ -168,6 +174,7 @@ fn init_report(root: &Path, stores: &[config::StoreSpec]) -> String {
 
 fn cmd_init() -> Result<(), String> {
     let (root, cfg) = load()?;
+    prepare(&root, &cfg);
     let out = mh_hooks::stores::init(&cfg.stores, &root, &mh_hooks::run_command);
     let mut failed = false;
     for (tool, outcome) in &out {
@@ -181,10 +188,33 @@ fn cmd_init() -> Result<(), String> {
     }
 }
 
+/// Before running anything for the project: commands the harness runs get
+/// the backends' store variables, the project's store folders are
+/// recorded, and the store folder names are kept out of git. Problems
+/// here are reported, never fatal.
+fn prepare(root: &Path, cfg: &Config) {
+    mh_hooks::set_child_env(cfg.storage_env(root));
+    let mut kinds: Vec<mh_core::storage::Kind> = Vec::new();
+    for st in cfg.backends.iter().filter_map(|b| b.storage.as_ref()) {
+        if !kinds.contains(&st.kind) {
+            kinds.push(st.kind);
+        }
+    }
+    for k in kinds {
+        if let Err(e) = mh_core::storage::record(k, root) {
+            eprintln!("mem-harness: {e}");
+        }
+    }
+    if let Err(e) = mh_core::storage::ensure_git_exclude(root, &cfg.git_exclude) {
+        eprintln!("mem-harness: {e}");
+    }
+}
+
 fn cmd_mcp() -> Result<(), String> {
     // Windows: the backends must not hold Claude Code's pipes to us.
     mh_sys::stop_std_inheritance();
     let (root, cfg) = load()?;
+    prepare(&root, &cfg);
     let natives = natives(&root, &cfg);
     let input = std::io::BufReader::new(std::io::stdin());
     mh_proxy::serve(cfg, root, natives, input, std::io::stdout())
@@ -206,7 +236,10 @@ fn cmd_hook(rest: &[String]) -> ExitCode {
     let _ = std::io::stdin().take(1 << 20).read_to_string(&mut stdin);
     // A hook never stops the session, even if something panics.
     let ran = std::panic::catch_unwind(|| {
-        load().and_then(|(root, cfg)| mh_hooks::run_hook(&cfg, &root, event, &stdin))
+        load().and_then(|(root, cfg)| {
+            prepare(&root, &cfg);
+            mh_hooks::run_hook(&cfg, &root, event, &stdin)
+        })
     })
     .unwrap_or_else(|_| Err("internal error (panic); please report it".to_string()));
     match ran {
@@ -224,6 +257,7 @@ fn cmd_hook(rest: &[String]) -> ExitCode {
 
 fn cmd_brief(rest: &[String]) -> Result<(), String> {
     let (root, cfg) = load()?;
+    prepare(&root, &cfg);
     let agent = match rest {
         [] => cfg.main_agent.clone(),
         [flag, name] if flag == "--agent" => name.clone(),
@@ -331,10 +365,107 @@ fn cmd_doctor(rest: &[String]) -> ExitCode {
             println!("FAIL cli      `{cli}` not found; needed by {needs}");
         }
     }
+    for b in &cfg.backends {
+        let Some(st) = &b.storage else { continue };
+        match cfg.storage_dir(&b.name, &root) {
+            Some(d) => println!(
+                "ok   store     {:<9} {} ({})",
+                b.name,
+                d.display(),
+                st.kind.as_str()
+            ),
+            None => {
+                ok = false;
+                println!(
+                    "FAIL store     {:<9} no home folder to keep its store in",
+                    b.name
+                );
+            }
+        }
+    }
+    // Store folders left in the project by tools before the harness kept
+    // them elsewhere (the opt-in memory stores are meant to be here).
+    for name in &cfg.git_exclude {
+        let name = name.trim_end_matches('/');
+        let wanted = cfg.stores.iter().any(|st| st.dir == name);
+        if !wanted && root.join(name).exists() {
+            println!(
+                "warn old store {} is no longer used (its store is kept outside the project now); delete it when you no longer need it",
+                root.join(name).display()
+            );
+        }
+    }
     if ok {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+fn cmd_env(rest: &[String]) -> Result<(), String> {
+    let ps = match rest {
+        [] => false,
+        [f] if f == "--powershell" => true,
+        _ => return Err("env takes only --powershell".into()),
+    };
+    let (root, cfg) = load()?;
+    for (k, v) in cfg.storage_env(&root) {
+        if ps {
+            println!("$env:{k} = {}", ps_quote(&v));
+        } else {
+            println!("export {k}={}", sh_quote(&v));
+        }
+    }
+    for b in &cfg.backends {
+        if let (Some(st), Some(d)) = (&b.storage, cfg.storage_dir(&b.name, &root)) {
+            if !st.arg.is_empty() {
+                println!("# {}: pass {} {}", b.command, st.arg, d.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn human(bytes: u64) -> String {
+    match bytes {
+        b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / f64::from(1u32 << 30)),
+        b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / f64::from(1u32 << 20)),
+        b => format!("{} KB", b.div_ceil(1024)),
+    }
+}
+
+fn cmd_projects(rest: &[String]) -> Result<(), String> {
+    match rest {
+        [] => {
+            let all = mh_core::storage::list();
+            if all.is_empty() {
+                println!("no stores kept by the harness yet");
+            }
+            for e in all {
+                let state = if e.exists { "" } else { "  (project gone)" };
+                println!(
+                    "{:<5} {:>8}  {}  {}{state}",
+                    e.kind.as_str(),
+                    human(e.bytes),
+                    e.id,
+                    if e.path.is_empty() { "?" } else { &e.path }
+                );
+            }
+            Ok(())
+        }
+        [cmd, old, new] if cmd == "move" => {
+            for line in mh_core::storage::move_project(old, Path::new(new))? {
+                println!("moved {line}");
+            }
+            Ok(())
+        }
+        [cmd, what] if cmd == "forget" => {
+            for d in mh_core::storage::forget(what)? {
+                println!("removed {}", d.display());
+            }
+            Ok(())
+        }
+        _ => Err("projects takes: nothing, move OLD NEW, or forget PROJECT".into()),
     }
 }
 

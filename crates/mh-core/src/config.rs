@@ -62,6 +62,19 @@ pub const BASE_ENV: &[&str] = &[
     "NUMBER_OF_PROCESSORS",
 ];
 
+/// A backend's `storage` setting: the harness gives it a store folder
+/// outside the project (see [`crate::storage`]).
+#[derive(Clone, Debug)]
+pub struct StorageSpec {
+    /// What the store holds: rebuildable `cache` or `data` that must last.
+    pub kind: crate::storage::Kind,
+    /// The variable the backend reads for its store folder, or
+    pub env: String,
+    /// the flag it takes before the folder (`--storage-dir`). One of the two.
+    pub arg: String,
+}
+
+/// One backend: how to start it and what to hide in it.
 #[derive(Clone, Debug)]
 pub struct BackendSpec {
     /// Short name; also the prefix of every tool the proxy exposes for it.
@@ -95,6 +108,9 @@ pub struct BackendSpec {
     /// Leave processes the server started running when its connection ends
     /// (normally the whole process group is stopped with it).
     pub keep_children: bool,
+    /// Where the backend keeps its store, when the harness places it
+    /// outside the project (see [`crate::storage`]).
+    pub storage: Option<StorageSpec>,
     /// The whole JSON object of this backend; kind-specific settings live
     /// under its `settings` key.
     pub raw: Value,
@@ -119,6 +135,7 @@ impl BackendSpec {
             hide_tools: Vec::new(),
             only_tools: Vec::new(),
             keep_children: false,
+            storage: None,
             raw: Value::obj(vec![]),
         }
     }
@@ -155,8 +172,11 @@ pub struct SectionSpec {
     pub weight: usize,
     /// For `text`: the heading line put above the output.
     pub heading: String,
-    /// Run only when this path exists in the project (for example `.chisel`).
+    /// Run only when this path exists in the project.
     pub only_if_exists: String,
+    /// Run only when this backend's store folder exists (see
+    /// [`Config::storage_dir`]).
+    pub only_if_store: String,
     /// The MCP tool the brief's "trimmed" note points to; default `name`.
     pub tool: String,
 }
@@ -219,6 +239,10 @@ pub struct Config {
     pub profiles: BTreeMap<String, BTreeMap<String, Vec<Trim>>>,
     pub stores: Vec<StoreSpec>,
     pub brief_sections: Vec<SectionSpec>,
+    /// Folder names listed in each repository's `.git/info/exclude` (see
+    /// [`crate::storage::ensure_git_exclude`]): store folders that must
+    /// never be committed, should a tool write one there anyway.
+    pub git_exclude: Vec<String>,
     /// Where the config came from (`built-in`, a file path, plus any
     /// project overlay).
     pub source: String,
@@ -243,6 +267,7 @@ const ALL_KEYS: &[&str] = &[
     "backends",
     "stores",
     "brief_sections",
+    "git_exclude",
     "$comment",
 ];
 
@@ -391,6 +416,46 @@ impl Config {
             env.push((b.disable_env.clone(), disabled.join(",")));
         }
         env
+    }
+
+    /// The store folder of `backend` for the project at `root`, when its
+    /// `storage` setting places it outside the project.
+    pub fn storage_dir(&self, backend: &str, root: &Path) -> Option<PathBuf> {
+        let st = self.backend(backend)?.storage.as_ref()?;
+        crate::storage::store_dir(st.kind, root, backend)
+    }
+
+    /// The backend as started for the project at `root`, with its extra
+    /// environment: [`Config::backend_env`], plus its store folder through
+    /// its `storage` variable, or its `storage` flag appended to `args`.
+    pub fn launch(&self, spec: &BackendSpec, root: &Path) -> (BackendSpec, Vec<(String, String)>) {
+        let mut spec = spec.clone();
+        let mut env = self.backend_env(&spec.name);
+        if let (Some(st), Some(dir)) = (spec.storage.clone(), self.storage_dir(&spec.name, root)) {
+            let dir = dir.to_string_lossy().into_owned();
+            if !st.env.is_empty() {
+                env.retain(|(k, _)| k != &st.env);
+                env.push((st.env, dir));
+            } else {
+                spec.args.push(st.arg);
+                spec.args.push(dir);
+            }
+        }
+        (spec, env)
+    }
+
+    /// The store variables of every backend that takes one, for commands
+    /// the harness runs itself (the brief's `chisel issues`), so they read
+    /// the same stores as the servers.
+    pub fn storage_env(&self, root: &Path) -> Vec<(String, String)> {
+        self.backends
+            .iter()
+            .filter_map(|b| {
+                let st = b.storage.as_ref().filter(|st| !st.env.is_empty())?;
+                let dir = self.storage_dir(&b.name, root)?;
+                Some((st.env.clone(), dir.to_string_lossy().into_owned()))
+            })
+            .collect()
     }
 
     /// The name the proxy exposes for a backend's tool:
@@ -795,6 +860,25 @@ fn known_keys(v: &Value, known: &[&str], ctx: &str) -> Result<(), String> {
 }
 
 /// An environment variable name: letters, digits and `_`, not starting with a digit.
+fn storage_spec(v: &Value, ctx: &str) -> Result<StorageSpec, String> {
+    if v.as_object().is_none() {
+        return Err(format!("{ctx}: object expected"));
+    }
+    known_keys(v, &["kind", "env", "arg"], ctx)?;
+    let kind = opt_str(v, "kind");
+    let kind = crate::storage::Kind::parse(&kind)
+        .ok_or_else(|| format!("{ctx}.kind: \"cache\" or \"data\" expected, got {kind:?}"))?;
+    let (env, arg) = (opt_str(v, "env"), opt_str(v, "arg"));
+    match (env.is_empty(), arg.is_empty()) {
+        (false, true) if valid_env_key(&env) => {}
+        (false, true) => return Err(format!("{ctx}.env: {env:?} is not a variable name")),
+        (true, false) if arg.starts_with('-') => {}
+        (true, false) => return Err(format!("{ctx}.arg: a flag such as --storage-dir expected")),
+        _ => return Err(format!("{ctx}: give one of env or arg")),
+    }
+    Ok(StorageSpec { kind, env, arg })
+}
+
 fn valid_env_key(k: &str) -> bool {
     !k.is_empty()
         && !k.starts_with(|c: char| c.is_ascii_digit())
@@ -961,6 +1045,7 @@ fn parse_config(v: &Value, _source: &str) -> Result<Config, String> {
                 "hide_tools",
                 "only_tools",
                 "keep_children",
+                "storage",
                 "settings",
             ],
             &ctx,
@@ -1022,6 +1107,10 @@ fn parse_config(v: &Value, _source: &str) -> Result<Config, String> {
             hide_tools: str_list(b.get("hide_tools"), &format!("{ctx}.hide_tools"))?,
             only_tools: str_list(b.get("only_tools"), &format!("{ctx}.only_tools"))?,
             keep_children: bool_or(b, "keep_children", false, &ctx)?,
+            storage: match b.get("storage") {
+                None => None,
+                Some(st) => Some(storage_spec(st, &format!("{ctx}.storage"))?),
+            },
             raw: b.clone(),
         });
     }
@@ -1137,6 +1226,7 @@ fn parse_config(v: &Value, _source: &str) -> Result<Config, String> {
                     "weight",
                     "heading",
                     "only_if_exists",
+                    "only_if_store",
                     "tool",
                 ],
                 &ctx,
@@ -1149,6 +1239,7 @@ fn parse_config(v: &Value, _source: &str) -> Result<Config, String> {
                 weight: int_in(sec, "weight", 10, 0, 1000, &ctx)? as usize,
                 heading: opt_str(sec, "heading"),
                 only_if_exists: opt_str(sec, "only_if_exists"),
+                only_if_store: opt_str(sec, "only_if_store"),
                 tool: match opt_str(sec, "tool") {
                     t if t.is_empty() => str_field(sec, "name", &ctx)?,
                     t => t,
@@ -1167,6 +1258,20 @@ fn parse_config(v: &Value, _source: &str) -> Result<Config, String> {
         profiles,
         stores,
         brief_sections,
+        git_exclude: {
+            let list = str_list(v.get("git_exclude"), "git_exclude")?;
+            for n in &list {
+                let bare = n.trim_end_matches('/');
+                if bare.is_empty()
+                    || bare.contains(['/', '\\', '*', '!', '\n'])
+                    || bare == "."
+                    || bare == ".."
+                {
+                    return Err(format!("git_exclude: {n:?} is not a plain folder name"));
+                }
+            }
+            list
+        },
         source: _source.to_string(),
     })
 }

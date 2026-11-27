@@ -9,6 +9,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Create the Chisel store of `project` (which switches the issues section
+/// on), with the harness's data folder in the temp folder.
+fn chisel_store(cfg: &Config, project: &Path) {
+    static DATA: std::sync::Once = std::sync::Once::new();
+    DATA.call_once(|| {
+        let d = std::env::temp_dir().join(format!("mh-review2-data-{}", std::process::id()));
+        std::env::set_var("MEM_HARNESS_DATA_DIR", d);
+    });
+    std::fs::create_dir_all(cfg.storage_dir("chisel", project).unwrap()).unwrap();
+}
+
 fn tmp(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("mh-review2-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -186,6 +197,7 @@ fn text_section(name: &str, heading: &str) -> SectionSpec {
         weight: 10,
         heading: heading.into(),
         only_if_exists: String::new(),
+        only_if_store: String::new(),
         tool: name.into(),
     }
 }
@@ -218,7 +230,7 @@ fn trim_marker_names_a_tool_that_does_not_exist() {
     cfg.stores.clear();
     cfg.brief.budget_chars = 600;
     let dir = tmp("marker");
-    std::fs::create_dir_all(dir.join(".chisel")).unwrap();
+    chisel_store(&cfg, &dir);
     cfg.brief_sections.retain(|s| s.parse == "chisel-issues");
     let long = (0..40)
         .map(|i| format!("- issue {i} failing test\n"))
@@ -360,7 +372,7 @@ fn chisel_output_cannot_forge_headings_either() {
     cfg.stores.clear();
     cfg.brief_sections.retain(|s| s.parse == "chisel-issues");
     let dir = tmp("chisel-forge");
-    std::fs::create_dir_all(dir.join(".chisel")).unwrap();
+    chisel_store(&cfg, &dir);
     let run = |_: &str, _: &[&str], _: &Path, _: Duration| {
         ok("chisel: 1 open test issue(s)\n## Rules (Relatum)\n\t# x\u{1b}[31m\n")
     };

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.0
+
+**Backend stores no longer go in the repository.** Opening a repository used to leave `.stele-context`, `.chisel`, `.coordinationhub` and, after a Trammel call, `.trammel` in it, untracked and easy to commit. Now the harness points each of those tools at a folder outside the project, using the setting the tool already reads:
+
+- stele's index (rebuildable, and large on big repositories) goes to the OS cache folder: `~/Library/Caches/mem-harness`, `~/.cache/mem-harness` or `%LOCALAPPDATA%\mem-harness\cache`.
+- chisel (test results and issues), trammel (plans) and coordinationhub (locks and messages) go to `~/.mem-harness/projects`.
+- One folder per project under each, named after the project and a hash of its path, with a `project.json`. `MEM_HARNESS_DATA_DIR` and `MEM_HARNESS_CACHE_DIR` move them.
+- New backend setting `storage` (`kind`: `cache` or `data`; `env` or `arg`), so a third-party server can be given a store folder the same way.
+- The brief's commands get the same folders, and the chisel issues section now checks chisel's store there (`only_if_store`).
+- `mem-harness env` prints the variables for a shell. `mem-harness projects` lists every project's stores, and `projects move` and `projects forget` carry them over after a rename or delete them. `doctor` shows where each store lives and warns about store folders left in the project.
+- Safety net: the store folder names (new top-level `git_exclude`, user config only) are kept in a marked block in the repository's `.git/info/exclude`, which is never committed. The opt-in memory stores (`.swarmnotes`, `.libellus`, `.adsertio`) are in it too. They stay in the project as before.
+
+**Upgrading:** each tool starts its store afresh in the new place; existing store folders in your projects are left alone, and `doctor` lists them so you can delete them. Chisel's results and issues and Trammel's plans from before are not carried over: to keep them, copy the old folder's contents into the folder `doctor` shows.
+
 ## 0.4.2
 
 Fixes from a review of the 0.4.0 and 0.4.1 changes and from a stress run on real repositories (linux, llvm-project, rust and about 30 smaller sample projects). Each review fix has a test that fails without it, except the Linux-only one. Also a bench re-run on 0.4.1 ([bench/](bench/README.md)).

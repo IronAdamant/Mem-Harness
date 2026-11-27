@@ -9,4 +9,4 @@ pub mod stores;
 
 pub use brief::{assemble, compose_brief, compose_brief_with, Section};
 pub use hook::run_hook;
-pub use run::{adopt_orphans, run_command, CmdOut};
+pub use run::{adopt_orphans, run_command, set_child_env, CmdOut};

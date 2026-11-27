@@ -54,7 +54,7 @@ pub fn serve<R: BufRead, W: Write + Send + 'static>(
     let plan: Vec<_> = cfg
         .backends
         .iter()
-        .map(|spec| (spec.clone(), cfg.backend_env(&spec.name)))
+        .map(|spec| cfg.launch(spec, &project))
         .collect();
     let make = move |sink: EventSink| {
         plan.into_iter()

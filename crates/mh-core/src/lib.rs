@@ -8,7 +8,9 @@
 pub mod config;
 pub mod identity;
 pub mod project;
+pub mod storage;
 
 pub use config::{
-    BackendSpec, Config, Ownership, Route, SectionSpec, StoreSpec, Trim, BASE_ENV, KNOWN_KINDS,
+    BackendSpec, Config, Ownership, Route, SectionSpec, StorageSpec, StoreSpec, Trim, BASE_ENV,
+    KNOWN_KINDS,
 };
