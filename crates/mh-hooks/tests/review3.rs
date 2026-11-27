@@ -45,7 +45,10 @@ fn items_over_the_cap_are_reported() {
     let dir = std::env::temp_dir().join(format!("mh-review3-cap-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join(".libellus")).unwrap();
-    let list: String = (0..25).map(|i| format!("- finding: f{i}\n")).collect();
+    let mut list = String::new();
+    for i in 0..25 {
+        list.push_str(&format!("- finding: f{i}\n"));
+    }
     let stdin = mh_json::Value::obj(vec![(
         "compact_summary",
         mh_json::Value::str(format!("## Not yet recorded\n{list}")),
