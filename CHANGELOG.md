@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.2
 
 Fixes from a review of the 0.4.0 and 0.4.1 changes, each with a test that fails without it (the Linux-only one excepted).
 
