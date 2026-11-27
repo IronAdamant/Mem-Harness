@@ -363,7 +363,7 @@ fn cfg_store<'a>(stores: &'a [mh_core::StoreSpec], tool: &str) -> Option<&'a mh_
 
 fn run_section(
     spec: &SectionSpec,
-    stores: &[mh_core::StoreSpec],
+    cfg: &Config,
     project: &Path,
     agent: &str,
     timeout: Duration,
@@ -372,6 +372,14 @@ fn run_section(
     if !spec.only_if_exists.is_empty() && !project.join(&spec.only_if_exists).exists() {
         return None;
     }
+    if !spec.only_if_store.is_empty()
+        && !cfg
+            .storage_dir(&spec.only_if_store, project)
+            .is_some_and(|d| d.is_dir())
+    {
+        return None;
+    }
+    let stores = cfg.stores.as_slice();
     if spec.parse == "relatum-rules" {
         // The Relatum store from config when listed there, else its
         // default; found with the same lookup as the Setup section.
@@ -428,7 +436,6 @@ type Runner<'a> = dyn Fn(&str, &[&str], &Path, Duration) -> Result<CmdOut, Strin
 /// sections are `cfg.brief_sections`, in order, each run on its own thread.
 pub fn compose_brief_with(cfg: &Config, project: &Path, agent: &str, run: &Runner) -> String {
     let timeout = Duration::from_secs(cfg.brief.command_timeout_s.max(1));
-    let stores = cfg.stores.as_slice();
     let built: Vec<Option<Section>> = std::thread::scope(|s| {
         let handles: Vec<_> = cfg
             .brief_sections
@@ -436,7 +443,7 @@ pub fn compose_brief_with(cfg: &Config, project: &Path, agent: &str, run: &Runne
             .map(|spec| {
                 (
                     spec,
-                    s.spawn(move || run_section(spec, stores, project, agent, timeout, run)),
+                    s.spawn(move || run_section(spec, cfg, project, agent, timeout, run)),
                 )
             })
             .collect();
@@ -672,12 +679,24 @@ mod tests {
         );
     }
 
+    /// Create the Chisel store of `project` (which switches the issues
+    /// section on), with the harness's data folder in the temp folder.
+    fn chisel_store(cfg: &Config, project: &Path) {
+        static DATA: std::sync::Once = std::sync::Once::new();
+        DATA.call_once(|| {
+            let d = std::env::temp_dir().join(format!("mh-hooks-data-{}", std::process::id()));
+            std::env::set_var("MEM_HARNESS_DATA_DIR", d);
+        });
+        std::fs::create_dir_all(cfg.storage_dir("chisel", project).unwrap()).unwrap();
+    }
+
     #[test]
     fn compose_with_fake_runner() {
         let cfg = Config::builtin();
         let dir = std::env::temp_dir().join(format!("mh-hooks-{}-brief", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".chisel")).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        chisel_store(&cfg, &dir);
         let runner =
             |prog: &str, _a: &[&str], cwd: &Path, _t: Duration| -> Result<CmdOut, String> {
                 assert!(cwd.ends_with(dir.file_name().unwrap()));
@@ -726,7 +745,8 @@ mod tests {
         }
         let dir = std::env::temp_dir().join(format!("mh-hooks-{}-golden", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".chisel")).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        chisel_store(&cfg, &dir);
         let out = compose_brief_with(&cfg, &dir, "explore-1", &golden_runner);
         let want = "# Mem-Harness brief for explore-1\n\n\
 ## Setup\n\
@@ -749,6 +769,7 @@ mod tests {
             weight: 7,
             heading: format!("## {name} heading"),
             only_if_exists: gate.into(),
+            only_if_store: String::new(),
             tool: name.into(),
         };
         cfg.brief_sections = vec![

@@ -72,7 +72,40 @@ Adding things without code:
   `call_s`, `env_pass` (a restricted environment), and `hide_tools` /
   `only_tools`, which the proxy enforces whatever the server honours;
 - a brief section is a `brief_sections` entry (`parse: text` for any CLI);
-- a store for `init` is a `stores` entry.
+- a store for `init` is a `stores` entry;
+- a backend's own store goes outside the project with its `storage` setting.
+
+## Where backend stores live
+
+No backend store is written into the repository (`mh_core::storage`). A
+backend whose tool would make a folder there by default has a `storage`
+setting: the variable or flag the tool already reads for its store, and
+whether the store is a `cache` (rebuildable) or `data` (lost work if
+deleted). The harness gives it `<base>/<project id>/<backend>`:
+
+- `cache`: the OS cache folder (`~/Library/Caches/mem-harness`,
+  `$XDG_CACHE_HOME/mem-harness` or `~/.cache/mem-harness`,
+  `%LOCALAPPDATA%\mem-harness\cache`). Only stele's index, which is the
+  large part (gigabytes on linux or rust) and rebuilt if the system clears
+  it.
+- `data`: `~/.mem-harness/projects`. chisel (test results and issues, not
+  only analysis), trammel (plans) and coordinationhub (locks, messages).
+
+The project id is the folder name and an FNV-1a hash of the canonical path,
+so checkouts and worktrees never share a store, and nothing depends on git.
+`project.json` in each project folder names the path; `projects move` and
+`forget` act on it, and `move` checks every target before moving anything.
+The location is decided in one place, the harness config, and given to
+every way the harness starts a tool: `Config::launch` for the MCP servers,
+`Config::storage_env` for commands it runs itself (the brief's `chisel
+issues`, through `mh_hooks::set_child_env`), and `mem-harness env` for a
+shell. The tools themselves are unchanged: each already takes the setting.
+
+`git_exclude` names every store folder a tool might still write (and the
+opt-in memory stores, which must never be committed either). At each start
+the harness keeps a marked block of them in `<git common dir>/info/exclude`,
+found by reading `.git` and `commondir` files (no git process), so it covers
+every worktree. Lines outside the block are never touched.
 
 A new backend kind (for example local HTTP) is a name in `KNOWN_KINDS` plus
 an arm in `mh_backend::build`. Its own settings are read from
@@ -268,6 +301,12 @@ pointers come only from Adsertio (`adsertio_view`).
   on. On Linux such orphans are found, but with several hook commands
   running at once an orphan cannot be told apart by command, so a timeout
   stops every orphan the hook process adopted.
+- Stores are found by the project's path. Renaming or moving a project
+  starts it with empty stores until `mem-harness projects move` carries
+  them over; `doctor` and `projects` show the orphaned ones. A tool run by
+  hand without `mem-harness env` looks in the project and finds none.
+- Worktrees of one repository have separate stores (chisel's reuse of the
+  main checkout's snapshot only works when its stores are in the project).
 - The stop check's git snapshot does not see ignored files, files outside
   the repository, or an edit inside an untracked folder that git lists
   only as `dir/` (only the folder's own time is read). Edits the user makes

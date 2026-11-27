@@ -41,17 +41,19 @@
     { "tool": "adsertio", "dir": ".adsertio", "env": "ADSERTIO_DIR", "init": ["adsertio", "init"],
       "save_hint": "adsertio_claim for a result" }
   ],
+  "git_exclude": [".stele-context", ".chisel", ".trammel", ".coordinationhub", ".wikifier_staging", ".swarmnotes", ".libellus", ".adsertio"],
   "brief_sections": [
     { "name": "libellus_brief", "parse": "libellus", "command": "libellus", "args": ["brief", "--agent", "{agent}"], "weight": 50 },
     { "name": "relatum_ls", "parse": "relatum-rules", "weight": 20 },
     { "name": "adsertio_view", "parse": "adsertio-claims", "command": "adsertio",
       "args": ["view", "--compact", "--states", "unverified", "--states", "refuted", "--limit", "50", "--if-store"], "weight": 20 },
-    { "name": "issues", "parse": "chisel-issues", "command": "chisel", "args": ["issues", "--brief"], "weight": 10, "only_if_exists": ".chisel", "tool": "chisel_issues" }
+    { "name": "issues", "parse": "chisel-issues", "command": "chisel", "args": ["issues", "--brief"], "weight": 10, "only_if_store": "chisel", "tool": "chisel_issues" }
   ],
   "backends": [
     {
       "name": "stele",
       "kind": "stdio-mcp",
+      "storage": { "kind": "cache", "env": "STELE_CONTEXT_STORAGE_DIR" },
       "command": "stele-context",
       "args": ["serve-mcp"],
       "env": { "STELE_MCP_MODE": "lite" },
@@ -77,6 +79,7 @@
     {
       "name": "chisel",
       "kind": "stdio-mcp",
+      "storage": { "kind": "data", "env": "CHISEL_STORAGE_DIR" },
       "command": "chisel",
       "args": ["serve-mcp"],
       "env": {},
@@ -88,6 +91,7 @@
     {
       "name": "trammel",
       "kind": "stdio-mcp",
+      "storage": { "kind": "data", "env": "TRAMMEL_DB_PATH" },
       "command": "trammel",
       "args": ["mcp"],
       "env": {},
@@ -112,6 +116,7 @@
     {
       "name": "hub",
       "kind": "stdio-mcp",
+      "storage": { "kind": "data", "arg": "--storage-dir" },
       "command": "coordinationhub",
       "args": ["serve-mcp"],
       "env": {},

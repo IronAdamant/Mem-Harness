@@ -107,6 +107,17 @@ fn own_group(_cmd: &mut Command) {}
 /// started, or another thread's `ps`, is never mistaken for an orphan.
 static RUNNING: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
+/// Variables every command [`run_command`] starts gets, set once by
+/// [`set_child_env`].
+static CHILD_ENV: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+
+/// Give every command [`run_command`] starts these variables from now on
+/// (the backends' store folders, `Config::storage_env`), so a tool run by
+/// the brief reads the same store as its MCP server. The first call wins.
+pub fn set_child_env(env: Vec<(String, String)>) {
+    let _ = CHILD_ENV.set(env);
+}
+
 /// Set once [`adopt_orphans`] made this process a subreaper.
 static SUBREAPER: AtomicBool = AtomicBool::new(false);
 
@@ -220,6 +231,9 @@ pub fn run_command(
     let path = mh_core::project::find_command(program, cwd)
         .ok_or_else(|| format!("{program} not found on PATH or in ~/.cargo/bin; install it"))?;
     let mut cmd = Command::new(path);
+    if let Some(env) = CHILD_ENV.get() {
+        cmd.envs(env.iter().map(|(k, v)| (k, v)));
+    }
     cmd.args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())

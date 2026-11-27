@@ -123,6 +123,44 @@ backend with no `disable_env`, or `locks` on the hub. A trim is one group or
 tool name (letters, digits, `_`, `-`). Unknown keys are errors at every
 level, so a typo such as `env_passs` cannot silently turn a setting off.
 
+### Where the tools keep their data
+
+Nothing the backends store goes in your repository. Four of them would write a
+folder there by default; the harness points each at a folder of its own,
+outside the project:
+
+| Tool | Holds | Kept in |
+|---|---|---|
+| stele | its search index (rebuilt from the code if lost) | the OS cache folder: `~/Library/Caches/mem-harness` (macOS), `~/.cache/mem-harness` (Linux), `%LOCALAPPDATA%\mem-harness\cache` (Windows) |
+| chisel | test results, open issues, git analysis | `~/.mem-harness/projects` |
+| trammel | plans, recipes, handoff notes | `~/.mem-harness/projects` |
+| coordinationhub | locks, messages, handoffs | `~/.mem-harness/projects` |
+
+Each project gets one folder under each, named after the project folder and a
+hash of its path (`my-repo-3f2a…`), with a `project.json` saying which project
+it is. The cache folder is skipped by backups and may be cleared by the
+system: only the index lives there. `MEM_HARNESS_DATA_DIR` and
+`MEM_HARNESS_CACHE_DIR` (absolute paths) move either one.
+
+- `mem-harness doctor` shows the folders, and warns about store folders that
+  tools left in the project before.
+- `mem-harness env` prints the same variables for your shell, so a tool you run
+  by hand (`chisel issues`, `trammel status`) uses the same data:
+  `eval "$(mem-harness env)"`, or `mem-harness env --powershell | Invoke-Expression`.
+- `mem-harness projects` lists every project's folders with their size, and
+  marks those whose project is gone. After renaming or moving a project, run
+  `mem-harness projects move <old path> <new path>`; `mem-harness projects
+  forget <path or id>` deletes a project's data.
+
+The memory stores you create on purpose (`.swarmnotes`, `.libellus`,
+`.adsertio`, through `harness_init`) stay in the project or above it, where
+their tools look for them.
+
+As a safety net, the harness lists every store folder name (`git_exclude` in
+the config) in the repository's `.git/info/exclude`. That file belongs to your
+clone and is never committed, so a store folder a tool writes anyway still
+cannot be committed by accident.
+
 ### Adding a tool or a third-party MCP server
 
 Add a backend to your own config. A server that runs over stdio needs only
@@ -141,6 +179,7 @@ Its tools appear as `docs_<tool>`. The optional settings:
 | `call_s` | the cap on one call (default 3600) |
 | `env_pass` | gives it only the basic system variables plus these, instead of your whole environment. Use it for servers you did not write. |
 | `keep_children` | leave processes the server started running when it stops (normally everything it started is stopped with it: its process group on Unix, its job object on Windows) |
+| `storage` | keep the server's store outside the project: `{ "kind": "data", "env": "ITS_STORE_VAR" }`, or `"arg": "--its-store-flag"` for a flag. `kind` is `cache` (rebuildable, in the OS cache folder) or `data` (in `~/.mem-harness/projects`). Add its folder name to `git_exclude` too. |
 | `hide_tools` / `only_tools` | the proxy hides tools itself, so this works for servers that have no `*_DISABLE` variable. A pattern matches the server's own tool name, or that name after `strip_prefix`. `*` is a wildcard. |
 
 A remote server works through a stdio bridge such as `mcp-remote`. The
