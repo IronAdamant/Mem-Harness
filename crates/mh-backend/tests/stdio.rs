@@ -661,22 +661,27 @@ fn wrapped(tag: &str, env: &[(&str, &str)], limits: Limits) -> Fixture {
 
 /// The server behind a wrapper is stopped with it, even when it ignores
 /// EOF (on Windows this needs the job object; killing the wrapper alone
-/// would leave it running).
+/// would leave it running). The grace leaves the fake behind the wrapper
+/// time to read the EOF and log it before the kill: at 200 ms a loaded
+/// machine sometimes killed it first, and the EOF check failed.
 #[test]
 fn drop_stops_a_server_behind_a_wrapper() {
     let limits = Limits {
-        shutdown_grace: Duration::from_millis(200),
+        shutdown_grace: Duration::from_millis(1000),
         ..quick()
     };
     assert_drop_stops(wrapped("wrapdrop", &[("FAKE_IGNORE_EOF", "1")], limits));
 }
 
 /// A server behind a wrapper that never answers `initialize` is stopped
-/// when the handshake times out, not left running.
+/// when the handshake times out, not left running. The limit leaves the
+/// wrapper time to start the fake, which must log its pid first: at 500 ms
+/// a slow start was cut short before that, and the test failed about one
+/// run in five on a loaded machine.
 #[test]
 fn a_hung_server_behind_a_wrapper_is_stopped_at_the_handshake_timeout() {
     let limits = Limits {
-        handshake: Duration::from_millis(500),
+        handshake: Duration::from_millis(2000),
         restart_block: Duration::ZERO,
         ..quick()
     };
