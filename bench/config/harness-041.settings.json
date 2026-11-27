@@ -1,0 +1,103 @@
+{
+ "hooks": {
+  "SessionStart": [
+   {
+    "matcher": "startup|resume|clear|compact",
+    "hooks": [
+     {
+      "type": "command",
+      "command": "~/.cargo/bin/mem-harness",
+      "args": [
+       "hook",
+       "session-start"
+      ]
+     }
+    ]
+   }
+  ],
+  "SubagentStart": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "~/.cargo/bin/mem-harness",
+      "args": [
+       "hook",
+       "subagent-start"
+      ]
+     }
+    ]
+   }
+  ],
+  "PreCompact": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "~/.cargo/bin/mem-harness",
+      "args": [
+       "hook",
+       "pre-compact"
+      ]
+     }
+    ]
+   }
+  ],
+  "PostCompact": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "~/.cargo/bin/mem-harness",
+      "args": [
+       "hook",
+       "post-compact"
+      ]
+     }
+    ]
+   }
+  ],
+  "Stop": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "~/.cargo/bin/mem-harness",
+      "args": [
+       "hook",
+       "stop"
+      ]
+     }
+    ]
+   }
+  ],
+  "SubagentStop": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "~/.cargo/bin/mem-harness",
+      "args": [
+       "hook",
+       "subagent-stop"
+      ]
+     }
+    ]
+   }
+  ],
+  "UserPromptSubmit": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "~/.cargo/bin/mem-harness",
+      "args": [
+       "hook",
+       "prompt-submit"
+      ]
+     }
+    ]
+   }
+  ]
+ }
+}

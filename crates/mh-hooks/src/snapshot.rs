@@ -9,6 +9,11 @@
 //! SubagentStart for a sub-agent) and again after each Stop check, so one
 //! set of changes is asked about once.
 //!
+//! `HEAD` is kept apart from the rest, with the time the snapshot was
+//! taken: when only `HEAD` moved, the tree changed only if a commit was
+//! made since then (see [`changed`]). A `git pull`, `checkout` or `reset`
+//! moves `HEAD` to commits made earlier, elsewhere, and is not an edit.
+//!
 //! The file is `<temp>/mem-harness/<session_id>[-<agent_id>].snap`, names
 //! cleaned to `[A-Za-z0-9_-]`. It is written to a fresh temporary file and
 //! renamed into place, so a planted symlink is replaced, never followed.
@@ -108,9 +113,47 @@ fn status_paths(out: &str) -> Vec<&str> {
     paths
 }
 
-/// The working tree's state as git sees it, hashed; `None` outside a git
+/// One snapshot: when it was taken (Unix seconds), `HEAD` (`-` on an
+/// unborn branch), and a hash of everything else git reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snap {
+    pub taken: u64,
+    pub head: String,
+    pub tree: String,
+}
+
+impl Snap {
+    fn to_line(&self) -> String {
+        format!("2 {} {} {}", self.taken, self.head, self.tree)
+    }
+
+    fn from_line(s: &str) -> Option<Snap> {
+        let mut f = s.split_whitespace();
+        if f.next()? != "2" {
+            return None;
+        }
+        let taken = f.next()?.parse().ok()?;
+        let head = f.next()?.to_string();
+        let tree = f.next()?.to_string();
+        let hex =
+            |x: &str| !x.is_empty() && x.len() <= 64 && x.bytes().all(|b| b.is_ascii_hexdigit());
+        if f.next().is_some() || !(head == "-" || hex(&head)) || !hex(&tree) {
+            return None;
+        }
+        Some(Snap { taken, head, tree })
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The working tree's state as git sees it; `None` outside a git
 /// repository or when git fails. All git calls share `timeout`.
-pub fn take(project: &Path, timeout: Duration, run: &Runner) -> Option<String> {
+pub fn take(project: &Path, timeout: Duration, run: &Runner) -> Option<Snap> {
+    let taken = now_secs();
     let deadline = Instant::now() + timeout;
     let git = |args: &[&str]| -> Option<CmdOut> {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -131,8 +174,12 @@ pub fn take(project: &Path, timeout: Duration, run: &Runner) -> Option<String> {
     let top = PathBuf::from(top.stdout.trim_end_matches(['\n', '\r']));
     // An unborn branch has no HEAD; that is a state too.
     let head = git(&["rev-parse", "-q", "--verify", "HEAD"])?;
-    let mut text = format!("{}\0{}\0", head.code.unwrap_or(-1), head.stdout.trim());
-    text.push_str(&status.stdout);
+    let head = match (head.code, head.stdout.trim()) {
+        (Some(0), h) if !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit()) => h.to_string(),
+        (Some(1), "") => "-".to_string(),
+        _ => return None,
+    };
+    let mut text = status.stdout.clone();
     for p in status_paths(&status.stdout) {
         let stamp = match std::fs::symlink_metadata(top.join(p)) {
             Ok(m) => {
@@ -150,14 +197,56 @@ pub fn take(project: &Path, timeout: Duration, run: &Runner) -> Option<String> {
         text.push('\0');
         text.push_str(&stamp);
     }
-    Some(hash(text.as_bytes()))
+    Some(Snap {
+        taken,
+        head,
+        tree: hash(text.as_bytes()),
+    })
+}
+
+/// Whether the tree changed from `before` to `now`. A change in what git
+/// status reports always counts. When only `HEAD` moved, it counts if a
+/// commit that is not a merge, reachable from the new `HEAD` and not the
+/// old one, was made at or after `before` was taken: the turn committed.
+/// Commits a pull, checkout or reset brings in were made earlier, so
+/// moving to them does not count. When git cannot answer, it counts.
+pub fn changed(before: &Snap, now: &Snap, project: &Path, timeout: Duration, run: &Runner) -> bool {
+    if before.tree != now.tree {
+        return true;
+    }
+    if before.head == now.head {
+        return false;
+    }
+    if before.head == "-" || now.head == "-" {
+        return true;
+    }
+    let range = format!("{}..{}", before.head, now.head);
+    let args = [
+        "--no-optional-locks",
+        "log",
+        "--no-merges",
+        "--format=%ct",
+        range.as_str(),
+    ];
+    let Ok(out) = run("git", &args, project, timeout) else {
+        return true;
+    };
+    if out.code != Some(0) {
+        return true;
+    }
+    out.stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .any(|l| l.trim().parse::<u64>().map_or(true, |t| t >= before.taken))
 }
 
 /// The snapshot saved at `path`, if any.
-pub fn load(path: &Path) -> Option<String> {
+pub fn load(path: &Path) -> Option<Snap> {
     let s = std::fs::read_to_string(path).ok()?;
-    let s = s.trim();
-    (!s.is_empty() && s.len() <= 64).then(|| s.to_string())
+    if s.len() > 256 {
+        return None;
+    }
+    Snap::from_line(s.trim())
 }
 
 #[cfg(unix)]
@@ -177,7 +266,7 @@ fn make_dir(d: &Path) -> std::io::Result<()> {
 /// Save `snap` at `path`: written to a new file, then renamed over the old
 /// one. Old snapshots in the folder are removed. Errors are ignored: no
 /// baseline only means the next check falls back to tool names.
-pub fn save(path: &Path, snap: &str) {
+pub fn save(path: &Path, snap: &Snap) {
     let Some(d) = path.parent() else {
         return;
     };
@@ -192,7 +281,7 @@ pub fn save(path: &Path, snap: &str) {
         .write(true)
         .create_new(true)
         .open(&tmp)
-        .and_then(|mut f| f.write_all(snap.as_bytes()));
+        .and_then(|mut f| f.write_all(snap.to_line().as_bytes()));
     if written.is_err() || rename_retrying(&tmp, path).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -287,6 +376,20 @@ mod tests {
     }
 
     #[test]
+    fn snap_lines_round_trip_and_junk_is_refused() {
+        let s = Snap {
+            taken: 1_700_000_000,
+            head: "0123abcd".into(),
+            tree: "ffee".into(),
+        };
+        assert_eq!(Snap::from_line(&s.to_line()), Some(s));
+        // The 0.4 format (one bare hash) is no baseline, not a match.
+        assert_eq!(Snap::from_line("0123456789abcdef"), None);
+        assert_eq!(Snap::from_line("2 1 zz ffee"), None);
+        assert_eq!(Snap::from_line("2 1 - ffee extra"), None);
+    }
+
+    #[test]
     fn porcelain_paths() {
         let out = " M src/a.rs\0R  new.rs\0old.rs\0?? dir/\0";
         assert_eq!(status_paths(out), ["src/a.rs", "new.rs", "old.rs", "dir/"]);
@@ -302,9 +405,14 @@ mod tests {
         std::fs::write(&victim, "keep").unwrap();
         let _ = std::fs::remove_file(&path);
         std::os::unix::fs::symlink(&victim, &path).unwrap();
-        save(&path, "abc");
+        let snap = Snap {
+            taken: 1,
+            head: "-".into(),
+            tree: "abc".into(),
+        };
+        save(&path, &snap);
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
-        assert_eq!(load(&path).as_deref(), Some("abc"));
+        assert_eq!(load(&path), Some(snap));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&victim);
     }
@@ -334,9 +442,14 @@ mod windows_tests {
             std::thread::sleep(std::time::Duration::from_millis(200));
             drop(held);
         });
-        save(&path, "new");
+        let snap = Snap {
+            taken: 1,
+            head: "-".into(),
+            tree: "abc".into(),
+        };
+        save(&path, &snap);
         release.join().unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(load(&path), Some(snap));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

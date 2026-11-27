@@ -208,3 +208,62 @@ fn ping_replies_do_not_block_the_reader() {
 fn clip(s: &str) -> String {
     s.chars().take(300).collect()
 }
+
+/// A malformed request from the server that happens to carry the id of our
+/// pending call (servers number their requests on their own) is not our
+/// reply: the call gets the real reply that follows.
+#[test]
+fn a_malformed_server_request_does_not_fail_our_call() {
+    let script = r#"read l; id=$(printf '%s' "$l" | sed 's/.*"id":\([0-9]*\).*/\1/'); printf '{"jsonrpc":"2.0","id":%s,"method":"roots/list","params":{"x":"\\q"}}\n' "$id"; printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"; sleep 2"#;
+    let b = sh("badreq", script, limits(5000));
+    let r = b.call_tool("x", Value::obj(vec![]), None, &CancelToken::new());
+    assert!(r.is_ok(), "{r:?}");
+}
+
+/// A malformed reply to our call still fails it at once (0.4.1).
+#[test]
+fn a_malformed_reply_fails_the_call_at_once() {
+    let script = r#"read l; id=$(printf '%s' "$l" | sed 's/.*"id":\([0-9]*\).*/\1/'); printf '{"jsonrpc":"2.0","id":%s,"result":{"x":"\\q"}}\n' "$id"; sleep 5"#;
+    let b = sh("badreply", script, limits(4000));
+    let t = Instant::now();
+    let r = b.call_tool("x", Value::obj(vec![]), None, &CancelToken::new());
+    assert!(
+        matches!(r, Err(CallError::Rpc { code: -32700, .. })),
+        "{r:?}"
+    );
+    assert!(t.elapsed() < Duration::from_secs(2));
+}
+
+/// A server that reads one request at a time, busy with a slow call while
+/// one large call (over `MAX_BACKLOG`) is being written to it, is not
+/// stopped by the next small message: the line being written is not a
+/// backlog.
+#[test]
+fn one_large_call_to_a_busy_server_is_not_a_backlog() {
+    let perl = r#"$|=1; while (my $l = <STDIN>) { my ($id) = $l =~ /"id":(\d+)/; next unless defined $id; if ($l =~ /"name":"a"/) { sleep 2 } print "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{}}\n"; }"#;
+    let n = DIRS.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("mh-pipes-big-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let spec = BackendSpec::stdio("pl", "perl", &["-e", perl]);
+    let sink: EventSink = Arc::new(|_, _| {});
+    let b = Arc::new(StdioBackend::new(&spec, vec![], &dir, sink).with_limits(limits(20_000)));
+    b.start().unwrap();
+    let b1 = b.clone();
+    let slow =
+        thread::spawn(move || b1.call_tool("a", Value::obj(vec![]), None, &CancelToken::new()));
+    thread::sleep(Duration::from_millis(200));
+    let b2 = b.clone();
+    let big = thread::spawn(move || {
+        b2.call_tool(
+            "b",
+            big_args(mh_backend::stdio::MAX_BACKLOG + (1 << 20)),
+            None,
+            &CancelToken::new(),
+        )
+    });
+    thread::sleep(Duration::from_millis(500));
+    let small = b.call_tool("c", Value::obj(vec![]), None, &CancelToken::new());
+    assert!(small.is_ok(), "small: {small:?}");
+    assert!(slow.join().unwrap().is_ok());
+    assert!(big.join().unwrap().is_ok());
+}

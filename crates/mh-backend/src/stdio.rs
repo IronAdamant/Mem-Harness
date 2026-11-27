@@ -211,6 +211,8 @@ struct Conn {
     out: Mutex<Option<Sender<Vec<u8>>>>,
     /// Bytes queued and not yet written.
     queued: AtomicUsize,
+    /// The length of the line the writer is writing now (part of `queued`).
+    writing: AtomicUsize,
     child: Mutex<Child>,
     pending: Mutex<Pending>,
     tail: Mutex<VecDeque<String>>,
@@ -248,7 +250,12 @@ impl Conn {
     /// ending, and `end` fails whoever waits for a reply. A server that
     /// has left more than [`MAX_BACKLOG`] bytes unread is stopped.
     fn send(&self, msg: &Value) {
-        let before = self.queued.load(Ordering::SeqCst);
+        // The line the writer is in the middle of is not backlog: one big
+        // call to a busy server is waiting to be read, not piling up.
+        let before = self
+            .queued
+            .load(Ordering::SeqCst)
+            .saturating_sub(self.writing.load(Ordering::SeqCst));
         if before > MAX_BACKLOG {
             self.note_trouble(format!(
                 "stopped reading its stdin ({} MiB waiting to be written)",
@@ -265,7 +272,11 @@ impl Conn {
     /// reading: then it is dropped (the server has not read the earlier
     /// ones either).
     fn send_reply(&self, msg: &Value) {
-        if self.queued.load(Ordering::SeqCst) > REPLY_BACKLOG {
+        let waiting = self
+            .queued
+            .load(Ordering::SeqCst)
+            .saturating_sub(self.writing.load(Ordering::SeqCst));
+        if waiting > REPLY_BACKLOG {
             return;
         }
         self.push(msg);
@@ -765,8 +776,10 @@ fn writer_loop(conn: Arc<Conn>, mut stdin: ChildStdin, rx: Receiver<Vec<u8>>) {
         if conn.closed.load(Ordering::SeqCst) {
             break;
         }
+        conn.writing.store(line.len(), Ordering::SeqCst);
         let r = stdin.write_all(&line).and_then(|()| stdin.flush());
         conn.queued.fetch_sub(line.len(), Ordering::SeqCst);
+        conn.writing.store(0, Ordering::SeqCst);
         if let Err(e) = r {
             conn.note_trouble(format!("could not be written to ({e})"));
             conn.linger();
@@ -812,8 +825,13 @@ fn reader_loop(core: Arc<Core>, conn: Arc<Conn>, stdout: impl Read) {
                             clip(line)
                         );
                         // When it was the reply to a call, fail that call now
-                        // instead of letting it wait out its whole limit.
-                        let waiter = mh_json::find_id(line)
+                        // instead of letting it wait out its whole limit. A
+                        // request from the server (it has a "method") carries
+                        // the server's own ids, so it is no reply of ours.
+                        let seen = mh_json::peek(line);
+                        let waiter = seen
+                            .id
+                            .filter(|_| !seen.method)
                             .and_then(|id| id.as_i64())
                             .and_then(|n| u64::try_from(n).ok())
                             .and_then(|n| lock(&conn.pending).waiting.remove(&n));
@@ -1094,6 +1112,7 @@ impl Launch {
             job,
             out: Mutex::new(Some(tx)),
             queued: AtomicUsize::new(0),
+            writing: AtomicUsize::new(0),
             child: Mutex::new(child),
             pending: Mutex::new(Pending::default()),
             tail: Mutex::new(VecDeque::with_capacity(STDERR_LINES)),

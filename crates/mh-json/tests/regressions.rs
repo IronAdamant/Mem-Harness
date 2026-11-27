@@ -37,3 +37,22 @@ fn obj_with_repeated_key_get_and_set_agree() {
     o.set("a", Value::int(9));
     assert_eq!(o.get("a"), Some(&Value::int(9)));
 }
+
+/// `peek` sees the id and whether a `"method"` key is present, wherever
+/// it sits, past values that do not parse.
+#[test]
+fn peek_tells_requests_from_replies() {
+    let req = r#"{"jsonrpc":"2.0","id":2,"method":"roots/list","params":{"x":"\q"}}"#;
+    let p = mh_json::peek(req);
+    assert_eq!(p.id, Some(mh_json::Value::Num("2".into())));
+    assert!(p.method);
+    let late = r#"{"params":{"x":"\q"},"id":"a","method":"m"}"#;
+    assert!(mh_json::peek(late).method);
+    let reply = r#"{"jsonrpc":"2.0","id":2,"result":{"x":"\q"}}"#;
+    let p = mh_json::peek(reply);
+    assert_eq!(p.id, Some(mh_json::Value::Num("2".into())));
+    assert!(!p.method);
+    // A "method" inside a value is not the message's own.
+    assert!(!mh_json::peek(r#"{"id":1,"result":{"method":"x","y":"\q"}}"#).method);
+    assert_eq!(mh_json::peek("not json"), mh_json::Peek::default());
+}

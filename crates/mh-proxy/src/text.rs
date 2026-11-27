@@ -104,6 +104,15 @@ pub fn unavailable(tool: &str, backend: &str, why: &str) -> String {
     )
 }
 
+/// A call cut short because the harness itself is stopping (its client
+/// closed stdin): nothing is wrong with the backend.
+pub fn shutting_down(tool: &str, backend: &str, why: &str) -> String {
+    format!(
+        "{tool} did not finish: the harness is shutting down, so backend \"{backend}\" \
+         was stopped ({why})."
+    )
+}
+
 pub fn panicked(tool: &str, backend: &str, why: &str) -> String {
     format!(
         "{tool} failed: the harness's client for backend \"{backend}\" panicked: {why}. \

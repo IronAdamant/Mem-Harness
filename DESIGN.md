@@ -184,9 +184,15 @@ are `brief.edit_tools` and `brief.save_tools` (default edit tools `Edit`,
 `PowerShell`.
 
 Whether the turn changed files comes from git when it can
-(`mh_hooks::snapshot`). A snapshot is `HEAD`, the entries of `git
---no-optional-locks status --porcelain=v1 -z --untracked-files=normal`
-and each listed path's size and modification time, hashed. The baseline
+(`mh_hooks::snapshot`). A snapshot is the time it was taken, `HEAD`, and
+a hash of the entries of `git --no-optional-locks status --porcelain=v1 -z
+--untracked-files=normal` with each listed path's size and modification
+time. When only `HEAD` moved, the tree counts as changed only if a
+non-merge commit made since the baseline is reachable from the new `HEAD`
+and not the old one (`git log --no-merges --format=%ct old..new`): a
+commit made in the turn counts, a `pull`, `checkout` or `reset` to commits
+made earlier does not (a `pull --rebase` that rewrites local commits
+does). The baseline
 is taken at UserPromptSubmit (main agent) and SubagentStart (that
 sub-agent), and saved in `<temp>/mem-harness/<session_id>[-<agent_id>].snap`
 (ids cleaned to `[A-Za-z0-9_-]`; written to a fresh file and renamed, so a

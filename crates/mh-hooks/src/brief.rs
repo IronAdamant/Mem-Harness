@@ -290,7 +290,10 @@ pub fn claims_lines(label: &str, res: Result<CmdOut, String>) -> Option<Vec<Stri
 /// control characters are dropped (a tab becomes a space), and a line that
 /// would start with `#` gets its hashes put in brackets (`## x` becomes
 /// `[##] x`), so the output cannot open a heading of its own and pass as
-/// the harness's structure (a forged rules section or a second brief).
+/// the harness's structure (a forged rules section or a second brief). A
+/// line made only of `=`, `-`, `*` or `_` (and spaces) is bracketed whole
+/// (`---` becomes `[---]`): under a line of text it would make that line a
+/// heading, and alone it is a rule that splits the brief.
 pub fn neutralise(line: &str) -> String {
     let clean: String = line
         .chars()
@@ -301,6 +304,15 @@ pub fn neutralise(line: &str) -> String {
         })
         .collect();
     let body = clean.trim_start();
+    let trimmed = body.trim_end();
+    if !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|c| matches!(c, '=' | '-' | '*' | '_' | ' '))
+    {
+        let indent = &clean[..clean.len() - body.len()];
+        return format!("{indent}[{trimmed}]");
+    }
     let hashes = body.chars().take_while(|c| *c == '#').count();
     if hashes == 0 {
         return clean;

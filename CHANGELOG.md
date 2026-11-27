@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.2
+
+Fixes from a review of the 0.4.0 and 0.4.1 changes and from a stress run on real repositories (linux, llvm-project, rust and about 30 smaller sample projects). Each review fix has a test that fails without it, except the Linux-only one. Also a bench re-run on 0.4.1 ([bench/](bench/README.md)).
+
+**Hooks**
+- The stop check no longer asks to save after a turn whose only change is a `git pull`, `checkout` or `reset` to commits made earlier. `HEAD` moving now counts as an edit only when the turn made a commit. A snapshot saved by 0.4.x is not read as a baseline, so the first stop after upgrading falls back to the edit tools in the transcript.
+- The stop check reads transcript lines written with spaces after the colons (`"type": "user"`).
+- PostCompact still saves at most 20 "not yet recorded" items, but now reports how many more it left out.
+- A third-party line made only of `-`, `=`, `*` or `_` is bracketed in the brief (`[---]`): under a line of text it made that text a Markdown heading.
+- Linux: a hook timeout takes all its process facts from one `ps` snapshot, so a process that a still-running command starts at that moment is no longer taken for an orphan and killed. Before the KILL that follows TERM, each pid is checked again: still there under the same parent, or re-parented to init or to us. A pid that exited and was reused is not sent KILL.
+
+**Backends**
+- One call larger than 32 MiB to a server busy with another call no longer gets the server stopped as "not reading its stdin" at the next message: the line being written is not counted as backlog.
+- A malformed request from a server (its line has a `"method"`) no longer fails our pending call that has the same id; servers number their own requests. A malformed reply still fails its call at once.
+
+**Proxy**
+- A call that starts a failed backend itself now does so on its own thread, so a cancel ends the call at once instead of after the backend's whole handshake limit.
+- A request longer than the 64 MiB line limit is answered with its own id (read from the line's start), not `null`, so the client stops waiting.
+- A call cut short because the harness is shutting down says so, instead of advising to install the backend.
+
 ## 0.4.1
 
 Windows compatibility fixes from an adversarial review on Windows 11. Each one was reproduced there except the `env_pass` additions and the `USERPROFILE` order. macOS and Linux behave as before, apart from the JSON and Relatum changes, which apply everywhere.

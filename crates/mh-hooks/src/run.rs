@@ -126,52 +126,74 @@ pub fn adopt_orphans() {
 
 /// Stop the child's process group (its id is the child's pid), which also
 /// reaches any background process it started, and each of `others`
-/// (descendants that left the group, listed before anything was
-/// signalled): TERM first, then KILL after [`TERM_GRACE`] for anything
-/// that ignored it. This only runs on the timeout path, so the short wait
-/// costs nothing in a normal run. Uses `mh_sys`, so it needs no `kill`
-/// binary; a no-op where there are no signals (Windows).
-fn kill_group(pid: u32, others: &[u32]) {
-    let send = |sig: i32| {
-        let mut any = mh_sys::signal_group(pid, sig);
-        for &p in others {
-            any |= mh_sys::signal(p, sig);
-        }
-        any
-    };
+/// (descendants that left the group, with their parents, listed before
+/// anything was signalled): TERM first, then KILL after [`TERM_GRACE`] for
+/// anything that ignored it. Before the KILL the table is read again, and
+/// a pid in `others` is sent KILL only when it is still there under the
+/// same parent, or re-parented to init or to us (its parent exited on the
+/// TERM): one that exited and was reaped may have had its pid reused. The
+/// group itself needs no check, as its leader is our child, not yet
+/// reaped. This only runs on the timeout path, so the short wait costs
+/// nothing in a normal run. Uses `mh_sys`, so it needs no `kill` binary; a
+/// no-op where there are no signals (Windows).
+fn kill_group(pid: u32, others: &[(u32, u32)]) {
+    let mut any = mh_sys::signal_group(pid, mh_sys::SIGTERM);
+    for &(p, _) in others {
+        any |= mh_sys::signal(p, mh_sys::SIGTERM);
+    }
     // Signalling fails once no process is left.
-    if send(mh_sys::SIGTERM) {
-        std::thread::sleep(TERM_GRACE);
-        send(mh_sys::SIGKILL);
+    if !any {
+        return;
+    }
+    std::thread::sleep(TERM_GRACE);
+    mh_sys::signal_group(pid, mh_sys::SIGKILL);
+    if others.is_empty() {
+        return;
+    }
+    let now = mh_sys::ProcessTable::read();
+    let me = std::process::id();
+    for &(p, parent) in others {
+        if now
+            .parent(p)
+            .is_some_and(|pp| pp == parent || pp == 1 || pp == me)
+        {
+            mh_sys::signal(p, mh_sys::SIGKILL);
+        }
     }
 }
 
 /// How long a process group gets to exit on TERM before it is sent KILL.
 const TERM_GRACE: Duration = Duration::from_millis(200);
 
-/// What else to stop with a child: its descendants (`child` still
-/// running; read before any signal, so one that called `setsid` is found)
-/// and, when this process is a subreaper ([`adopt_orphans`]), the orphans
-/// re-parented to us: our descendants outside every running command's tree.
-/// Unix only: `ps` is read.
-fn stragglers(child: Option<u32>) -> Vec<u32> {
+/// What else to stop with a child, each with its parent: its descendants
+/// (`child` still running; read before any signal, so one that called
+/// `setsid` is found) and, when this process is a subreaper
+/// ([`adopt_orphans`]), the orphans re-parented to us: our direct children
+/// that are not a running command, with their own descendants. All of it
+/// comes from one `ps` snapshot, so a process a healthy command starts
+/// meanwhile is never taken for an orphan. Unix only.
+fn stragglers(child: Option<u32>) -> Vec<(u32, u32)> {
     if !cfg!(unix) {
         return Vec::new();
     }
     let running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
-    let mut v = child.map(mh_sys::descendants).unwrap_or_default();
+    let table = mh_sys::ProcessTable::read();
+    let mut v: Vec<u32> = child.map(|c| table.descendants(c)).unwrap_or_default();
     if SUBREAPER.load(Ordering::SeqCst) {
-        let mut owned: Vec<u32> = running.clone();
-        for &r in running.iter() {
-            owned.extend(mh_sys::descendants(r));
-        }
-        for p in mh_sys::descendants(std::process::id()) {
-            if !owned.contains(&p) && !v.contains(&p) {
-                v.push(p);
+        for orphan in table.children(std::process::id()) {
+            if running.contains(&orphan) {
+                continue;
+            }
+            for p in std::iter::once(orphan).chain(table.descendants(orphan)) {
+                if !v.contains(&p) {
+                    v.push(p);
+                }
             }
         }
     }
-    v
+    v.into_iter()
+        .filter_map(|p| table.parent(p).map(|pp| (p, pp)))
+        .collect()
 }
 
 fn kill_tree(child: &mut Child, job: Option<&mh_sys::Job>) {

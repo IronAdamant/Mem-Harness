@@ -335,20 +335,59 @@ pub fn become_subreaper() -> bool {
 /// nearest first. Read from `ps`, so it is a snapshot: a process that
 /// double-forks and is re-parented to init before the snapshot is not
 /// found (on Linux, [`become_subreaper`] prevents that). Empty when `ps`
-/// is missing or on platforms without it.
+/// is missing or on platforms without it. To ask several questions of one
+/// moment, read a [`ProcessTable`] once.
 pub fn descendants(root: u32) -> Vec<u32> {
-    let pairs = process_table();
-    let mut out = Vec::new();
-    let mut frontier = vec![root];
-    while let Some(p) = frontier.pop() {
-        for &(pid, ppid) in &pairs {
-            if ppid == p && pid != root && !out.contains(&pid) {
-                out.push(pid);
-                frontier.push(pid);
-            }
+    ProcessTable::read().descendants(root)
+}
+
+/// One `ps` snapshot of every process and its parent. Answers taken from
+/// one table agree with each other; answers from two `ps` runs need not
+/// (a process can start or exit between them).
+#[derive(Debug, Clone, Default)]
+pub struct ProcessTable {
+    pairs: Vec<(u32, u32)>,
+}
+
+impl ProcessTable {
+    /// Read the table now; empty where there is no `ps`.
+    pub fn read() -> ProcessTable {
+        ProcessTable {
+            pairs: process_table(),
         }
     }
-    out
+
+    /// The parent of `pid`, if `pid` is listed.
+    pub fn parent(&self, pid: u32) -> Option<u32> {
+        self.pairs
+            .iter()
+            .find(|&&(p, _)| p == pid)
+            .map(|&(_, pp)| pp)
+    }
+
+    /// The direct children of `pid`.
+    pub fn children(&self, pid: u32) -> Vec<u32> {
+        self.pairs
+            .iter()
+            .filter(|&&(_, pp)| pp == pid)
+            .map(|&(p, _)| p)
+            .collect()
+    }
+
+    /// Every descendant of `root`, nearest first.
+    pub fn descendants(&self, root: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut frontier = vec![root];
+        while let Some(p) = frontier.pop() {
+            for &(pid, ppid) in &self.pairs {
+                if ppid == p && pid != root && !out.contains(&pid) {
+                    out.push(pid);
+                    frontier.push(pid);
+                }
+            }
+        }
+        out
+    }
 }
 
 /// `(pid, ppid)` for every process, from `ps -A -o pid=,ppid=`.
@@ -439,6 +478,34 @@ mod tests {
         assert!(signal_group(child.id(), SIGKILL));
         let _ = child.wait();
         assert!(wait_gone(grandchild), "grandchild survived the group kill");
+    }
+
+    /// One table answers parent, children and descendants consistently.
+    #[test]
+    fn one_table_answers_every_question() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 30 & echo $!; wait"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        use std::io::BufRead;
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let grandchild: u32 = line.trim().parse().unwrap();
+        let t = ProcessTable::read();
+        let me = std::process::id();
+        assert_eq!(t.parent(child.id()), Some(me));
+        assert_eq!(t.parent(grandchild), Some(child.id()));
+        assert!(t.children(me).contains(&child.id()));
+        assert_eq!(t.children(child.id()), [grandchild]);
+        let d = t.descendants(me);
+        assert!(d.contains(&child.id()) && d.contains(&grandchild));
+        assert_eq!(t.parent(u32::MAX), None);
+        let _ = child.kill();
+        let _ = child.wait();
+        signal(grandchild, SIGKILL);
     }
 }
 
