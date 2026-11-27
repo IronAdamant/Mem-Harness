@@ -192,7 +192,83 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// The top-level `"id"` of a JSON-RPC message that does not parse as a
+/// whole (too deep, a bad escape elsewhere), so the error can still be
+/// sent for the right request. Only a number or string id is returned; a
+/// scan that cannot follow the text returns `None`. Iterative: no depth
+/// limit is needed.
+pub fn find_id(text: &str) -> Option<Value> {
+    let b = text.strip_prefix('\u{feff}').unwrap_or(text).as_bytes();
+    let ws = |i: &mut usize| {
+        while matches!(b.get(*i), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+            *i += 1;
+        }
+    };
+    // From an opening quote, the index just past the closing one.
+    let string_end = |mut i: usize| -> Option<usize> {
+        i += 1;
+        loop {
+            match *b.get(i)? {
+                b'"' => return Some(i + 1),
+                b'\\' => i += 2,
+                _ => i += 1,
+            }
+        }
+    };
+    let mut i = 0;
+    ws(&mut i);
+    if b.get(i) != Some(&b'{') {
+        return None;
+    }
+    i += 1;
+    loop {
+        ws(&mut i);
+        if b.get(i) != Some(&b'"') {
+            return None;
+        }
+        let key_end = string_end(i)?;
+        let key = &b[i..key_end];
+        i = key_end;
+        ws(&mut i);
+        if b.get(i) != Some(&b':') {
+            return None;
+        }
+        i += 1;
+        ws(&mut i);
+        let start = i;
+        // Skip the value: nested brackets and strings, to the next
+        // top-level `,` or `}`.
+        let mut depth = 0usize;
+        loop {
+            match *b.get(i)? {
+                b'"' => i = string_end(i)?,
+                b'{' | b'[' => {
+                    depth += 1;
+                    i += 1;
+                }
+                b'}' | b']' if depth > 0 => {
+                    depth -= 1;
+                    i += 1;
+                }
+                b',' | b'}' if depth == 0 => break,
+                _ => i += 1,
+            }
+        }
+        if key == b"\"id\"" {
+            let v = parse(std::str::from_utf8(&b[start..i]).ok()?.trim()).ok()?;
+            return matches!(v, Value::Num(_) | Value::Str(_)).then_some(v);
+        }
+        if b[i] == b'}' {
+            return None;
+        }
+        i += 1;
+    }
+}
+
+/// Parse one JSON text. A leading byte order mark is skipped: Windows
+/// editors and PowerShell write one. Error offsets count from after it.
 pub fn parse(text: &str) -> Result<Value, ParseError> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut p = Parser {
         b: text.as_bytes(),
         i: 0,
@@ -340,18 +416,17 @@ impl Parser<'_> {
                         b't' => out.push('\t'),
                         b'u' => {
                             let hi = self.hex4()?;
+                            // A lone surrogate becomes U+FFFD, as with
+                            // JavaScript's TextEncoder: JSON.stringify writes
+                            // one for a string cut inside a surrogate pair,
+                            // and refusing the whole message would lose it.
                             let code = if (0xD800..0xDC00).contains(&hi) {
-                                if !self.b[self.i..].starts_with(b"\\u") {
-                                    return Err(self.err("lone surrogate"));
+                                match self.low_surrogate()? {
+                                    Some(lo) => 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00),
+                                    None => 0xFFFD,
                                 }
-                                self.i += 2;
-                                let lo = self.hex4()?;
-                                if !(0xDC00..0xE000).contains(&lo) {
-                                    return Err(self.err("lone surrogate"));
-                                }
-                                0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
                             } else if (0xDC00..0xE000).contains(&hi) {
-                                return Err(self.err("lone surrogate"));
+                                0xFFFD
                             } else {
                                 hi
                             };
@@ -362,6 +437,23 @@ impl Parser<'_> {
                 }
                 Some(_) => return Err(self.err("control character in string")),
             }
+        }
+    }
+
+    /// After a high surrogate: the low surrogate escape that follows it,
+    /// consumed, or `None` (nothing consumed) when there is none.
+    fn low_surrogate(&mut self) -> Result<Option<u32>, ParseError> {
+        if !self.b[self.i..].starts_with(b"\\u") {
+            return Ok(None);
+        }
+        let at = self.i;
+        self.i += 2;
+        let lo = self.hex4()?;
+        if (0xDC00..0xE000).contains(&lo) {
+            Ok(Some(lo))
+        } else {
+            self.i = at;
+            Ok(None)
         }
     }
 
@@ -475,7 +567,43 @@ mod tests {
     #[test]
     fn decodes_surrogate_pairs() {
         assert_eq!(parse(r#""😀""#).unwrap(), Value::str("😀"));
-        assert!(parse(r#""\ud83d""#).is_err());
+        assert_eq!(parse(r#""\ud83d""#).unwrap(), Value::str("\u{fffd}"));
+        assert_eq!(parse(r#""a\udc00b""#).unwrap(), Value::str("a\u{fffd}b"));
+        // A high surrogate followed by an escape that is not a low one.
+        assert_eq!(parse(r#""\ud83dA""#).unwrap(), Value::str("\u{fffd}A"));
+        assert_eq!(parse(r#""\ud83d😀""#).unwrap(), Value::str("\u{fffd}😀"));
+        assert!(parse(r#""\ud83d\u00""#).is_err());
+    }
+
+    #[test]
+    fn finds_the_id_of_a_message_that_does_not_parse() {
+        let deep = format!(
+            r#"{{"jsonrpc":"2.0","method":"tools/call","params":{}{},"id":3}}"#,
+            "[".repeat(300),
+            "]".repeat(300)
+        );
+        assert!(parse(&deep).is_err());
+        assert_eq!(find_id(&deep), Some(Value::int(3)));
+        assert_eq!(
+            find_id(r#"{"id":"a,}\"b","params":{"x":"\q"}}"#),
+            Some(Value::str("a,}\"b"))
+        );
+        assert_eq!(
+            find_id(r#"{"params":{"id":1},"id":7,"#),
+            Some(Value::int(7))
+        );
+        assert_eq!(find_id(r#"{"params":{"id":1}}"#), None);
+        assert_eq!(find_id(r#"{"id":null}"#), None);
+        assert_eq!(find_id(r#"{"id":{"x":1}}"#), None);
+        assert_eq!(find_id("[1]"), None);
+        assert_eq!(find_id(r#"{"id":"#), None);
+        assert_eq!(find_id("\u{feff}{\"id\":2}"), Some(Value::int(2)));
+    }
+
+    #[test]
+    fn skips_a_byte_order_mark() {
+        assert_eq!(parse("\u{feff}{\"a\":1}").unwrap().to_json(), r#"{"a":1}"#);
+        assert!(parse("{}\u{feff}").is_err());
     }
 
     #[test]

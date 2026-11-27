@@ -46,6 +46,20 @@ pub const BASE_ENV: &[&str] = &[
     "PATHEXT",
     "PROGRAMDATA",
     "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMW6432",
+    "COMMONPROGRAMFILES",
+    "COMMONPROGRAMFILES(X86)",
+    "ALLUSERSPROFILE",
+    "PUBLIC",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "USERNAME",
+    "USERDOMAIN",
+    "COMPUTERNAME",
+    "OS",
+    "PROCESSOR_ARCHITECTURE",
+    "NUMBER_OF_PROCESSORS",
 ];
 
 #[derive(Clone, Debug)]
@@ -232,10 +246,14 @@ const ALL_KEYS: &[&str] = &[
     "$comment",
 ];
 
-/// The user's own config: `~/.mem-harness/harness.json`.
+/// The user's own config: `~/.mem-harness/harness.json`, with `~` from
+/// [`crate::project::home`] (`USERPROFILE` first on Windows).
 pub fn user_config_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(Path::new(&home).join(".mem-harness").join("harness.json"))
+    Some(
+        crate::project::home()?
+            .join(".mem-harness")
+            .join("harness.json"),
+    )
 }
 
 /// Does `pattern` match `name`? `*` matches any run of characters.
@@ -692,9 +710,18 @@ impl Config {
     }
 }
 
+/// Read a JSON file. A UTF-8 byte order mark is fine (mh_json skips it);
+/// UTF-16, which Windows PowerShell 5.1 writes for `>`, gets a clear error.
 fn read_json(p: &Path) -> Result<Value, String> {
+    let bytes = std::fs::read(p).map_err(|e| format!("cannot read {}: {e}", p.display()))?;
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        return Err(format!(
+            "{} is saved as UTF-16; save it as UTF-8 (in PowerShell: `Get-Content <file> | Set-Content -Encoding utf8 <file>`)",
+            p.display()
+        ));
+    }
     let text =
-        std::fs::read_to_string(p).map_err(|e| format!("cannot read {}: {e}", p.display()))?;
+        String::from_utf8(bytes).map_err(|e| format!("{} is not UTF-8 text: {e}", p.display()))?;
     mh_json::parse(&text).map_err(|e| format!("{}: {e}", p.display()))
 }
 
@@ -1387,7 +1414,9 @@ mod review_tests {
         let home = dir.join("home");
         std::fs::create_dir_all(&home).unwrap();
         let old_home = std::env::var_os("HOME");
+        let old_profile = std::env::var_os("USERPROFILE");
         std::env::set_var("HOME", &home);
+        std::env::set_var("USERPROFILE", &home);
         std::env::remove_var("MEM_HARNESS_CONFIG");
         std::env::remove_var("MEM_HARNESS_PROFILE");
         let overlay = project.join(".mem-harness").join("harness.json");
@@ -1433,6 +1462,10 @@ mod review_tests {
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
+        }
+        match old_profile {
+            Some(h) => std::env::set_var("USERPROFILE", h),
+            None => std::env::remove_var("USERPROFILE"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

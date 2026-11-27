@@ -193,10 +193,34 @@ pub fn save(path: &Path, snap: &str) {
         .create_new(true)
         .open(&tmp)
         .and_then(|mut f| f.write_all(snap.as_bytes()));
-    if written.is_err() || std::fs::rename(&tmp, path).is_err() {
+    if written.is_err() || rename_retrying(&tmp, path).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     prune(d);
+}
+
+/// `fs::rename`, retried for up to a second while the target is busy. On
+/// Windows a virus scanner or indexer opens a freshly written file without
+/// letting it be replaced, and the rename fails with "access denied" (os
+/// error 5) or a sharing violation (32) until it lets go; CI machines do
+/// not scan files, so this shows only on real ones.
+fn rename_retrying(from: &Path, to: &Path) -> std::io::Result<()> {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let mut wait = std::time::Duration::from_millis(5);
+    loop {
+        match std::fs::rename(from, to) {
+            Err(e)
+                if cfg!(windows)
+                    && (e.kind() == std::io::ErrorKind::PermissionDenied
+                        || e.raw_os_error() == Some(32))
+                    && std::time::Instant::now() + wait < until =>
+            {
+                std::thread::sleep(wait);
+                wait = (wait * 2).min(std::time::Duration::from_millis(100));
+            }
+            r => return r,
+        }
+    }
 }
 
 fn prune(d: &Path) {
@@ -283,5 +307,36 @@ mod tests {
         assert_eq!(load(&path).as_deref(), Some("abc"));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&victim);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// The snapshot is still replaced when another process (a virus
+    /// scanner, say) holds it open for a moment without share-delete.
+    #[test]
+    fn save_waits_out_a_reader_that_blocks_replacing_the_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("mh-snap-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.snap");
+        std::fs::write(&path, "old").unwrap();
+        // FILE_SHARE_READ only: no FILE_SHARE_DELETE, so a rename over it fails.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(held);
+        });
+        save(&path, "new");
+        release.join().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

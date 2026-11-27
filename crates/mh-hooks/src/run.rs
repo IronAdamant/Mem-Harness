@@ -12,7 +12,12 @@
 //! that double-forked out of the tree is found as well. Signals go through
 //! `mh_sys` (no `kill` binary needed). On macOS a process that double-forks
 //! and whose middle process exits before the timeout is re-parented to
-//! launchd and not found. On Windows only the child itself is killed.
+//! launchd and not found. On Windows the child is put in a job object as
+//! soon as it starts, so everything it starts afterwards is in the job too,
+//! and the job is ended where Unix kills the group. The hook process does
+//! not hand its own stdin, stdout and stderr to the child
+//! ([`mh_sys::stop_std_inheritance`], called at startup), so a process the
+//! child leaves running cannot hold Claude Code's pipe open.
 
 use std::io::Read;
 use std::path::Path;
@@ -169,7 +174,10 @@ fn stragglers(child: Option<u32>) -> Vec<u32> {
     v
 }
 
-fn kill_tree(child: &mut Child) {
+fn kill_tree(child: &mut Child, job: Option<&mh_sys::Job>) {
+    if let Some(j) = job {
+        j.terminate();
+    }
     let others = stragglers(Some(child.id()));
     kill_group(child.id(), &others);
     let _ = child.kill();
@@ -196,15 +204,19 @@ pub fn run_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     own_group(&mut cmd);
-    let mut child = {
+    let (mut child, job) = {
         let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
         let child = cmd
             .spawn()
             .map_err(|e| format!("cannot start {program}: {e}"))?;
+        // Windows: the stand-in for the process group. Not kill-on-close:
+        // as on Unix, a background process that lets go of the pipes is
+        // left running when the command ends in time.
+        let job = mh_sys::Job::new(false).filter(|j| j.assign(&child));
         running.push(child.id());
-        child
+        (child, job)
     };
-    let result = finish(program, &mut child, timeout);
+    let result = finish(program, &mut child, job.as_ref(), timeout);
     RUNNING
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -213,7 +225,12 @@ pub fn run_command(
 }
 
 /// Wait for a started child under the deadline; see [`run_command`].
-fn finish(program: &str, child: &mut Child, timeout: Duration) -> Result<CmdOut, String> {
+fn finish(
+    program: &str,
+    child: &mut Child,
+    job: Option<&mh_sys::Job>,
+    timeout: Duration,
+) -> Result<CmdOut, String> {
     let out = Drain::spawn(child.stdout.take());
     let err = Drain::spawn(child.stderr.take());
     let deadline = Instant::now() + timeout;
@@ -221,12 +238,12 @@ fn finish(program: &str, child: &mut Child, timeout: Duration) -> Result<CmdOut,
         match child.try_wait() {
             Ok(Some(s)) => break s,
             Ok(None) if Instant::now() >= deadline => {
-                kill_tree(child);
+                kill_tree(child, job);
                 return Err(format!("{program} timed out after {}s", timeout.as_secs()));
             }
             Ok(None) => std::thread::sleep(POLL),
             Err(e) => {
-                kill_tree(child);
+                kill_tree(child, job);
                 return Err(format!("cannot wait for {program}: {e}"));
             }
         }
@@ -236,6 +253,9 @@ fn finish(program: &str, child: &mut Child, timeout: Duration) -> Result<CmdOut,
         // keep what was read; the reader threads end when the pipes close.
         // The child is gone, so only orphans adopted on Linux can be
         // found outside its group.
+        if let Some(j) = job {
+            j.terminate();
+        }
         kill_group(child.id(), &stragglers(None));
         wait_drains(&out, &err, Instant::now() + GRACE);
     }
@@ -365,5 +385,61 @@ mod tests {
             !marker.exists(),
             "a process in its own session outlived the kill"
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// The child exits at once but a background process keeps stderr open:
+    /// the deadline still holds, and the output read so far is kept.
+    #[test]
+    fn background_process_holding_the_pipe_does_not_outlast_the_timeout() {
+        let cwd = std::env::temp_dir();
+        let t = Instant::now();
+        let r = run_command(
+            "cmd",
+            &["/c", "start /b ping -n 30 127.0.0.1 >nul & echo hi"],
+            &cwd,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert_eq!(r.stdout.trim(), "hi");
+        assert_eq!(r.code, Some(0));
+    }
+
+    /// A child that does not exit is stopped with everything it started:
+    /// killing `cmd` alone would leave the background process to write the
+    /// marker.
+    #[test]
+    fn timeout_kills_the_whole_tree() {
+        let dir = std::env::temp_dir().join(format!("mh-run-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("marker");
+        let script = dir.join("tree.cmd");
+        std::fs::write(
+            &script,
+            format!(
+                "@start /b cmd /c \"ping -n 3 127.0.0.1 >nul & echo x > {}\"\r\n@ping -n 30 127.0.0.1 >nul\r\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let t = Instant::now();
+        let e = run_command(
+            "cmd",
+            &["/c", &script.display().to_string()],
+            &dir,
+            Duration::from_millis(700),
+        )
+        .unwrap_err();
+        assert!(e.contains("timed out"), "{e}");
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        std::thread::sleep(Duration::from_millis(3500));
+        assert!(!marker.exists(), "the background process outlived the kill");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

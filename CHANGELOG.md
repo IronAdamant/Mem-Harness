@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.4.1
+
+Windows compatibility fixes from an adversarial review on Windows 11. Each one was reproduced there except the `env_pass` additions and the `USERPROFILE` order. macOS and Linux behave as before, apart from the JSON and Relatum changes, which apply everywhere.
+
+**Processes (Windows)**
+- Backend servers and hook commands are put in a job object as soon as they start, and the job is ended where Unix stops the process group. Before, only the direct child was killed, so a server behind `npx`, `uvx` or a `.cmd` shim kept running after shutdown, a crash restart or a handshake timeout, and a hung one never exited. The README and the 0.4.0 notes said otherwise.
+- The MCP server and the hooks no longer hand their own stdin, stdout and stderr to every process they start. A process a hook command left running used to hold Claude Code's pipe open, so the hook looked hung until that process exited (10 s past the timeout in the repro).
+- Tests that check this now run on Windows too: servers behind a `.cmd` wrapper are stopped at shutdown and at a handshake timeout, and a timed-out hook command's background process is stopped with it.
+
+**Files and paths (Windows)**
+- A `harness.json` that starts with a byte order mark (Notepad, `Set-Content -Encoding utf8`) loads. Before, every hook went silent and `mcp` refused to start. A UTF-16 file (Windows PowerShell 5.1's `>`) gets an error saying to save it as UTF-8.
+- The project root is shown as `C:\repo`, not `\\?\C:\repo`. The model built paths from the old form, and CoordinationHub took a lock on `\\?\C:\repo\a.txt` to be a different file from `a.txt`.
+- `~` is `%USERPROFILE%` (where cargo and PowerShell look) before `HOME`.
+- The stop check's snapshot is saved even when a virus scanner holds the old file for a moment: a busy rename is retried for up to 1 s. Before, the save failed silently, and the next stop asked again about changes that had already been asked about.
+- Command lookup skips a file with no extension (such as a Git Bash shell script), which Windows cannot start (os error 193).
+- `env_pass` keeps more of the Windows basics: `HOMEDRIVE`, `HOMEPATH`, `USERNAME`, `USERDOMAIN`, `COMPUTERNAME`, `OS`, `PROCESSOR_ARCHITECTURE`, `NUMBER_OF_PROCESSORS`, `ProgramFiles(x86)`, `ProgramW6432`, `CommonProgramFiles` (and its `(x86)` form), `ALLUSERSPROFILE` and `PUBLIC`.
+
+**JSON-RPC (all platforms)**
+- A lone UTF-16 surrogate escape (`"\ud83d"`, which `JSON.stringify` writes for a string cut inside an emoji) is read as U+FFFD. Before, the whole message was refused. A backend reply refused that way was dropped, and its call waited out `call_s` (1 hour by default).
+- A backend reply that does not parse fails its call at once, with -32700.
+- A client request that does not parse (for example, nested over 256 levels) is answered with its own id, not `null`, so the client is not left waiting.
+- A byte order mark before a message is skipped (PowerShell pipes add one).
+
+**Relatum**
+- One sub-folder of `.swarmnotes` that cannot be read is reported as damaged. Before, it hid every rule from the brief.
+
 ## 0.4.0
 
 Fixes from a second adversarial review (30 confirmed, 15 plausible findings), and the known limits, except Windows-specific work.

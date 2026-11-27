@@ -74,11 +74,14 @@ impl Backend for Fake {
                 open = g.1.wait(open).unwrap();
             }
         }
-        if self
+        // `fetch_update` is deprecated on newer toolchains; `try_update` needs a
+        // newer one than the 1.83 this builds with.
+        #[allow(deprecated)]
+        let flaky = self
             .flaky_starts
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
+            .is_ok();
+        if flaky {
             return Err(CallError::Timeout("no initialize reply within 30 s".into()));
         }
         self.started.store(true, Ordering::SeqCst);
@@ -775,7 +778,8 @@ fn unknown_tools_and_methods_and_bad_input() {
             .and_then(Value::as_i64)
             == Some(-32700)
     });
-    assert!(v.get("id").unwrap().is_null());
+    // The id is found in the broken text, so request 5 is answered.
+    assert_eq!(v.get("id").unwrap().to_json(), "5");
     h.send(r#"[{"jsonrpc":"2.0","id":6,"method":"ping"}]"#);
     let v = h.wait("batch error", |v| {
         v.get("error")
@@ -1610,4 +1614,29 @@ fn line_one_byte_over_max_line_is_skipped() {
         Some(-32700)
     );
     assert_eq!(out[1].get("id").unwrap().to_json(), "2");
+}
+
+/// A request too deep to parse is answered with its own id, and a byte
+/// order mark before the first message (PowerShell writes one) is skipped.
+#[test]
+fn unparseable_request_is_answered_with_its_id_and_a_bom_is_skipped() {
+    let h = start(vec![], vec![]);
+    h.tx.as_ref()
+        .unwrap()
+        .send(b"\xEF\xBB\xBF{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n".to_vec())
+        .unwrap();
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"x","arguments":{}{}}}}}"#,
+        "[".repeat(300),
+        "]".repeat(300)
+    ));
+    let out = h.finish();
+    assert_eq!(out.len(), 2, "{out:?}");
+    assert_eq!(out[0].get("id").unwrap().to_json(), "1");
+    assert!(out[0].get("result").is_some(), "{:?}", out[0]);
+    assert_eq!(out[1].get("id").unwrap().to_json(), "2");
+    assert_eq!(
+        out[1].get("error").unwrap().get("code").unwrap().as_i64(),
+        Some(-32700)
+    );
 }

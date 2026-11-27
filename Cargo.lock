@@ -4,21 +4,22 @@ version = 4
 
 [[package]]
 name = "mem-harness"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "mh-core",
  "mh-hooks",
  "mh-json",
  "mh-proxy",
+ "mh-sys",
 ]
 
 [[package]]
 name = "mh-adapters"
-version = "0.4.0"
+version = "0.4.1"
 
 [[package]]
 name = "mh-backend"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "mh-core",
  "mh-json",
@@ -27,14 +28,14 @@ dependencies = [
 
 [[package]]
 name = "mh-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "mh-json",
 ]
 
 [[package]]
 name = "mh-hooks"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "mh-adapters",
  "mh-core",
@@ -44,11 +45,11 @@ dependencies = [
 
 [[package]]
 name = "mh-json"
-version = "0.4.0"
+version = "0.4.1"
 
 [[package]]
 name = "mh-proxy"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "mh-backend",
  "mh-core",
@@ -57,4 +58,4 @@ dependencies = [
 
 [[package]]
 name = "mh-sys"
-version = "0.4.0"
+version = "0.4.1"
