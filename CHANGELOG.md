@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.2
+
+macOS test fixes. No change to the harness itself.
+
+- `a_hung_server_behind_a_wrapper_is_stopped_at_the_handshake_timeout` gave the handshake 500 ms. When the shell wrapper was slow to start the fake server, the harness stopped it before the fake had logged its pid, and the test failed (2 runs in 7 on a Mac). The limit is now 2 s.
+- `drop_stops_a_server_behind_a_wrapper` gave the server 200 ms between closing its stdin and the kill. Under load the fake behind the wrapper was sometimes killed before it logged the EOF, and the EOF check failed. The grace is now 1 s. In both tests the server was stopped correctly; only the check came too early.
+
 ## 0.5.1
 
 Windows test coverage. No change to the harness itself.
