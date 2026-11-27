@@ -430,6 +430,15 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
+    /// Tests that start processes, one at a time: one test lists every
+    /// descendant of the test process, and another's children exiting
+    /// meanwhile would make that list stale.
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn wait_gone(pid: u32) -> bool {
         let end = Instant::now() + Duration::from_secs(3);
         while Instant::now() < end {
@@ -452,6 +461,7 @@ mod tests {
 
     #[test]
     fn group_signal_reaches_a_grandchild() {
+        let _one = serial();
         use std::os::unix::process::CommandExt;
         // The shell prints its background child's pid, then waits.
         let mut child = Command::new("/bin/sh")
@@ -483,6 +493,7 @@ mod tests {
     /// One table answers parent, children and descendants consistently.
     #[test]
     fn one_table_answers_every_question() {
+        let _one = serial();
         let mut child = Command::new("/bin/sh")
             .args(["-c", "sleep 30 & echo $!; wait"])
             .stdout(Stdio::piped())
