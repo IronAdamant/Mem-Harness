@@ -109,8 +109,10 @@ fn fnv(bytes: &[u8]) -> u64 {
 /// The id of the project at `root`: its folder name, cleaned to
 /// `[A-Za-z0-9._-]` and cut to 40 characters, a `-`, and 16 hex digits
 /// hashed from the full path (lower-cased on Windows, where case does not
-/// matter).
+/// matter, and without a `\\?\` prefix, so both spellings of one folder
+/// get one id).
 pub fn project_id(root: &Path) -> String {
+    let root = &crate::project::plain(root.to_path_buf());
     let name: String = root
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -150,7 +152,9 @@ pub fn record(kind: Kind, root: &Path) -> Result<PathBuf, String> {
     let dir = project_dir(kind, root).ok_or("no home folder to keep stores in")?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let file = dir.join(PROJECT_FILE);
-    let want = root.to_string_lossy().into_owned();
+    let want = crate::project::plain(root.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
     if read_path(&file).as_deref() != Some(want.as_str()) {
         let body = Value::obj(vec![("path", Value::str(want))]).to_json() + "\n";
         std::fs::write(&file, body).map_err(|e| format!("cannot write {}: {e}", file.display()))?;

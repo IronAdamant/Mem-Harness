@@ -22,6 +22,8 @@ fn bases() -> PathBuf {
 fn project(name: &str) -> PathBuf {
     let d = bases().join("projects").join(name);
     std::fs::create_dir_all(&d).unwrap();
+    // Canonical, as the harness's project root is (on Windows that adds a
+    // `\\?\` prefix, which the ids and records must not depend on).
     d.canonicalize().unwrap()
 }
 
@@ -47,9 +49,12 @@ fn record_list_move_forget() {
     .unwrap();
     let mine: Vec<_> = storage::find(old.to_str().unwrap());
     assert_eq!(mine.len(), 2, "{mine:?}");
-    assert!(mine
-        .iter()
-        .all(|e| e.exists && e.path == old.to_string_lossy()));
+    let plain = |p: &Path| {
+        mh_core::project::plain(p.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert!(mine.iter().all(|e| e.exists && e.path == plain(&old)));
     assert!(mine.iter().any(|e| e.kind == Kind::Data && e.bytes >= 5));
 
     // Renamed: the old path is gone, its stores are listed as such.
@@ -63,9 +68,7 @@ fn record_list_move_forget() {
     let chisel = storage::store_dir(Kind::Data, &new, "chisel").unwrap();
     assert_eq!(std::fs::read_to_string(chisel.join("x")).unwrap(), "12345");
     let now = storage::find(new.to_str().unwrap());
-    assert!(now
-        .iter()
-        .all(|e| e.exists && e.path == new.to_string_lossy()));
+    assert!(now.iter().all(|e| e.exists && e.path == plain(&new)));
 
     // Moving onto a project that has stores is refused.
     let other = project("other");
